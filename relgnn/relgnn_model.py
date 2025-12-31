@@ -9,11 +9,10 @@ from torch_geometric.nn import MLP
 from torch_geometric.typing import NodeType
 
 from relbench.modeling.nn import HeteroEncoder, HeteroTemporalEncoder
-from relgnn_nn import RelGNN
+from relgnn.relgnn_nn import RelGNN
 
 
 class RelGNN_Model(torch.nn.Module):
-
     def __init__(
         self,
         data: HeteroData,
@@ -108,6 +107,31 @@ class RelGNN_Model(torch.nn.Module):
         )
 
         return self.head(x_dict[entity_table][: seed_time.size(0)])
+
+    def forward_entity(
+        self,
+        batch: HeteroData,
+        entity_table: NodeType,
+    ) -> Tensor:
+        seed_time = batch[entity_table].seed_time
+        x_dict = self.encoder(batch.tf_dict)
+
+        rel_time_dict = self.temporal_encoder(
+            seed_time, batch.time_dict, batch.batch_dict
+        )
+
+        for node_type, rel_time in rel_time_dict.items():
+            x_dict[node_type] = x_dict[node_type] + rel_time
+
+        for node_type, embedding in self.embedding_dict.items():
+            x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
+
+        x_dict = self.gnn(
+            x_dict,
+            batch.edge_index_dict,
+        )
+
+        return x_dict[entity_table][: seed_time.size(0)]
 
     def forward_dst_readout(
         self,

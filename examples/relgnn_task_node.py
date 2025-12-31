@@ -33,9 +33,9 @@ parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument(
     "--cache_dir",
     type=str,
-    default=os.path.expanduser("~/.cache/relbench_examples"),
+    default=os.path.expanduser("/data/starlab/relbench_examples"),
 )
-parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/")
+parser.add_argument("--checkpoint_dir", type=str, default="/data/starlab/ckpts/relgnn/")
 
 args = parser.parse_args()
 

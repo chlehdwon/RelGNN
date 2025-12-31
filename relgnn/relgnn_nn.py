@@ -5,7 +5,9 @@ import torch_frame
 from torch import Tensor
 from torch_frame.data.stats import StatType
 from torch_frame.nn.models import ResNet
-from torch_geometric.nn import HeteroConv, LayerNorm, PositionalEncoding, SAGEConv
+from torch_geometric.nn import LayerNorm, PositionalEncoding
+from relgnn.relgnn_conv import RelGNNConv
+from relgnn.relgnn_hetero_conv import RelGNN_HeteroConv
 from torch_geometric.typing import EdgeType, NodeType
 
 
@@ -122,30 +124,33 @@ class HeteroTemporalEncoder(torch.nn.Module):
         return out_dict
 
 
-class HeteroGraphSAGE(torch.nn.Module):
+class RelGNN(torch.nn.Module):
     def __init__(
         self,
         node_types: List[NodeType],
         edge_types: List[EdgeType],
         channels: int,
-        aggr: str = "mean",
-        num_layers: int = 2,
+        aggr: str = "sum",
+        num_model_layers: int = 2,
+        num_heads: int = 1,
+        simplified_MP=False,
     ):
         super().__init__()
 
         self.convs = torch.nn.ModuleList()
-        for _ in range(num_layers):
-            conv = HeteroConv(
+        for _ in range(num_model_layers):
+            conv = RelGNN_HeteroConv(
                 {
-                    edge_type: SAGEConv((channels, channels), channels, aggr=aggr)
+                    edge_type: RelGNNConv(edge_type[0], (channels, channels), channels, num_heads, aggr=aggr, simplified_MP=simplified_MP)
                     for edge_type in edge_types
                 },
-                aggr="sum",
+                aggr=aggr,
+                simplified_MP=simplified_MP,
             )
             self.convs.append(conv)
 
         self.norms = torch.nn.ModuleList()
-        for _ in range(num_layers):
+        for _ in range(num_model_layers):
             norm_dict = torch.nn.ModuleDict()
             for node_type in node_types:
                 norm_dict[node_type] = LayerNorm(channels, mode="node")
