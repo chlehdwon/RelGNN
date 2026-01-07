@@ -17,8 +17,9 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 import argparse
+import random
 
 from relbench.base import EntityTask
 from relbench.modeling.utils import to_unix_time
@@ -286,6 +287,200 @@ class ARSampleDataset(Dataset):
         }
 
 
+class RandomARSampleDataset(IterableDataset):
+    """
+    PyTorch IterableDataset for auto-regressive samples with random sampling per epoch.
+    
+    This dataset generates random AR samples on-the-fly for each epoch, providing
+    different samples every time the DataLoader iterates.
+    
+    Each sample contains:
+        - entity_id: int
+        - input_timestamps: (window_size,) - left-aligned, padded with zeros on the right
+        - input_embeddings: (window_size, embed_dim) - left-aligned, padded with zeros on the right
+        - input_labels: (window_size,) - left-aligned, padded with zeros on the right
+        - input_mask: (window_size,) - True for valid positions, False for padding
+        - target_timestamp: float
+        - target_embedding: (embed_dim,)
+        - target_label: float
+    """
+    
+    def __init__(
+        self,
+        entity_sequences: Dict[int, List[Tuple[float, np.ndarray, float]]],
+        split_indices: Dict[int, Dict[str, int]],
+        split_name: str,
+        window_size: int = 10,
+        min_input_length: int = 0,
+        samples_per_epoch: Optional[int] = None,
+        use_strict: bool = False,
+        seed: Optional[int] = None,
+    ):
+        """
+        Args:
+            entity_sequences: Dict[entity_id -> cumulative List[(timestamp, embedding, label)]]
+            split_indices: Dict[entity_id -> {'train_end': int, 'val_end': int}]
+            split_name: Name of current split ('train', 'val', or 'test')
+            window_size: Maximum number of past timesteps to use as input
+            min_input_length: Minimum number of valid input timesteps required
+            samples_per_epoch: Number of samples to generate per epoch. If None, generates all possible samples.
+            use_strict: If True, use strict temporal boundaries (no data leakage)
+            seed: Random seed for reproducibility (None for random)
+        """
+        self.entity_sequences = entity_sequences
+        self.split_indices = split_indices
+        self.split_name = split_name
+        self.window_size = window_size
+        self.min_input_length = min_input_length
+        self.samples_per_epoch = samples_per_epoch
+        self.use_strict = use_strict
+        self.seed = seed
+        
+        # Pre-compute all possible sample indices for efficient random sampling
+        self._precompute_sample_indices()
+    
+    def __len__(self) -> int:
+        """
+        Return the number of samples per epoch.
+        
+        If samples_per_epoch is set, return that value.
+        Otherwise, return the total number of possible samples.
+        """
+        if self.samples_per_epoch is not None:
+            return min(self.samples_per_epoch, len(self.sample_indices))
+        return len(self.sample_indices)
+    
+    def _precompute_sample_indices(self):
+        """Pre-compute all possible (entity_id, target_idx) pairs for random sampling."""
+        self.sample_indices = []
+        
+        for entity_id, sequence in self.entity_sequences.items():
+            seq_len = len(sequence)
+            if seq_len < 1:
+                continue
+            
+            indices = self.split_indices[entity_id]
+            
+            # Determine target range for this split
+            if self.split_name == 'train':
+                target_start = 0
+                target_end = indices['train_end']
+            elif self.split_name == 'val':
+                target_start = indices['train_end']
+                target_end = indices['val_end']
+            else:  # test
+                target_start = indices['val_end']
+                target_end = seq_len
+            
+            # Add all valid target indices
+            for target_idx in range(target_start, target_end):
+                # Check if this sample would have sufficient input length
+                if self.use_strict:
+                    if self.split_name == 'train':
+                        available_input_end = target_idx
+                    else:
+                        input_end = indices['train_end'] if self.split_name == 'val' else indices['val_end']
+                        available_input_end = min(input_end, target_idx)
+                else:
+                    available_input_end = target_idx
+                
+                start_idx = max(0, available_input_end - self.window_size)
+                input_len = available_input_end - start_idx
+                
+                if input_len >= self.min_input_length:
+                    self.sample_indices.append((entity_id, target_idx))
+    
+    def __iter__(self):
+        """
+        Generate random AR samples for this epoch.
+        
+        Returns:
+            Iterator over sample dictionaries
+        """
+        # Set random seed for this epoch if provided
+        if self.seed is not None:
+            random.seed(self.seed + hash(str(self.sample_indices[:10])) % 1000000)
+        
+        # Randomly sample indices
+        if self.samples_per_epoch is not None and self.samples_per_epoch < len(self.sample_indices):
+            sampled_indices = random.sample(self.sample_indices, self.samples_per_epoch)
+        else:
+            sampled_indices = self.sample_indices.copy()
+            random.shuffle(sampled_indices)
+        
+        # Generate samples
+        for entity_id, target_idx in sampled_indices:
+            sample = self._create_sample(entity_id, target_idx)
+            if sample is not None:
+                yield {
+                    'entity_id': torch.tensor(sample['entity_id'], dtype=torch.long),
+                    'input_timestamps': torch.tensor(sample['input_timestamps'], dtype=torch.float32),
+                    'input_embeddings': torch.tensor(sample['input_embeddings'], dtype=torch.float32),
+                    'input_labels': torch.tensor(sample['input_labels'], dtype=torch.float32),
+                    'input_mask': torch.tensor(sample['input_mask'], dtype=torch.bool),
+                    'target_timestamp': torch.tensor(sample['target_timestamp'], dtype=torch.float32),
+                    'target_embedding': torch.tensor(sample['target_embedding'], dtype=torch.float32),
+                    'target_label': torch.tensor(sample['target_label'], dtype=torch.float32),
+                }
+    
+    def _create_sample(self, entity_id: int, target_idx: int) -> Optional[Dict]:
+        """Create a single AR sample for given entity and target index."""
+        sequence = self.entity_sequences[entity_id]
+        seq_len = len(sequence)
+        
+        if seq_len < 1:
+            return None
+        
+        embed_dim = sequence[0][1].shape[0]
+        indices = self.split_indices[entity_id]
+        
+        # Determine input range
+        if self.use_strict:
+            if self.split_name == 'train':
+                available_input_end = target_idx
+            else:
+                input_end = indices['train_end'] if self.split_name == 'val' else indices['val_end']
+                available_input_end = min(input_end, target_idx)
+        else:
+            available_input_end = target_idx
+        
+        # Extract input sequence
+        start_idx = max(0, available_input_end - self.window_size)
+        input_seq = sequence[start_idx:available_input_end]
+        input_len = len(input_seq)
+        
+        if input_len < self.min_input_length:
+            return None
+        
+        # Target
+        target = sequence[target_idx]
+        
+        # Create padded arrays
+        input_timestamps = np.zeros(self.window_size, dtype=np.float32)
+        input_embeddings = np.zeros((self.window_size, embed_dim), dtype=np.float32)
+        input_labels = np.zeros(self.window_size, dtype=np.float32)
+        input_mask = np.zeros(self.window_size, dtype=bool)
+        
+        # Fill with actual data (left-aligned)
+        if input_len > 0:
+            ts, embs, lbls = zip(*input_seq)
+            input_timestamps[:input_len] = ts
+            input_embeddings[:input_len] = np.stack(embs)
+            input_labels[:input_len] = lbls
+            input_mask[:input_len] = True
+        
+        return {
+            'entity_id': entity_id,
+            'input_timestamps': input_timestamps,
+            'input_embeddings': input_embeddings,
+            'input_labels': input_labels,
+            'input_mask': input_mask,
+            'target_timestamp': target[0],
+            'target_embedding': target[1],
+            'target_label': target[2],
+        }
+
+
 def create_ar_dataloaders(
     entity_sequences: Dict[str, Dict[int, List[Tuple[float, np.ndarray, float]]]],
     split_indices: Dict[str, Dict[int, Dict[str, int]]],
@@ -384,6 +579,64 @@ def create_strict_ar_dataloaders(
             dataset,
             batch_size=batch_size,
             shuffle=(split == 'train'),
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+    
+    return dataloaders
+
+
+def create_random_ar_dataloaders(
+    entity_sequences: Dict[str, Dict[int, List[Tuple[float, np.ndarray, float]]]],
+    split_indices: Dict[str, Dict[int, Dict[str, int]]],
+    window_size: int = 10,
+    batch_size: int = 32,
+    num_workers: int = 0,
+    min_input_length: int = 0,
+    samples_per_epoch: Optional[int] = None,
+    use_strict: bool = False,
+    seed: Optional[int] = None,
+) -> Dict[str, DataLoader]:
+    """
+    Create DataLoaders for auto-regressive training with random sampling per epoch.
+    
+    Each epoch will generate different random samples from the entity sequences,
+    providing data augmentation through random sampling.
+    
+    Args:
+        entity_sequences: Dict[split -> Dict[entity_id -> cumulative sequence]]
+        split_indices: Dict[split -> Dict[entity_id -> {'train_end': int, 'val_end': int}]]
+        window_size: Maximum number of past timesteps to use as input
+        batch_size: Batch size
+        num_workers: Number of dataloader workers
+        min_input_length: Minimum number of valid inputs required (default: 0)
+        samples_per_epoch: Number of samples to generate per epoch. If None, generates all possible samples.
+        use_strict: If True, use strict temporal boundaries (no data leakage)
+        seed: Random seed for reproducibility (None for random)
+    
+    Returns:
+        Dict with 'train', 'val', 'test' DataLoaders
+    """
+    dataloaders = {}
+    
+    for split in ['train', 'val', 'test']:
+        # Create random AR dataset
+        dataset = RandomARSampleDataset(
+            entity_sequences[split],
+            split_indices[split],
+            split_name=split,
+            window_size=window_size,
+            min_input_length=min_input_length,
+            samples_per_epoch=samples_per_epoch,
+            use_strict=use_strict,
+            seed=seed,
+        )
+        
+        # Create dataloader (no shuffle needed for IterableDataset)
+        dataloaders[split] = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,  # IterableDataset handles randomness internally
             num_workers=num_workers,
             pin_memory=torch.cuda.is_available(),
         )

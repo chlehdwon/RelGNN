@@ -6,8 +6,8 @@ from typing import Dict
 
 import numpy as np
 import torch
-from relgnn_model import RelGNN_Model
-from text_embedder import GloveTextEmbedding
+from relgnn.relgnn_model import RelGNN_Model
+from relgnn.text_embedder import GloveTextEmbedding
 from torch.nn import BCEWithLogitsLoss, L1Loss
 from torch_frame import stype
 from torch_frame.config.text_embedder import TextEmbedderConfig
@@ -22,9 +22,9 @@ from relbench.datasets import get_dataset
 from relbench.modeling.graph import get_node_train_table_input, make_pkey_fkey_graph
 from relbench.modeling.utils import get_stype_proposal
 from relbench.tasks import get_task
-from utils import get_configs
+from relgnn.utils import get_configs
 
-from atomic_routes import get_atomic_routes
+from relgnn.atomic_routes import get_atomic_routes
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", type=str, default="rel-amazon")

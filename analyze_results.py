@@ -32,6 +32,7 @@ def analyze_results(json_path):
         
         row = {
             'model': setting['model'],
+            'mode': setting.get('mode', 'recent'),
             'lr': setting['lr'],
             'weight_decay': setting['weight_decay'],
             'num_heads': setting['num_heads'],
@@ -59,6 +60,8 @@ def analyze_results(json_path):
     print("BEST SETTING:")
     print(f"{'='*80}")
     best = df.iloc[0]
+    print(f"Model: {best['model']}")
+    print(f"Mode: {best['mode']}")
     print(f"Learning Rate: {best['lr']}")
     print(f"Weight Decay: {best['weight_decay']}")
     print(f"Number of Heads: {best['num_heads']}")

@@ -334,3 +334,57 @@ class RelGNN_Head(nn.Module):
         return logits
 
 
+class EntityMeanBaseline(nn.Module):
+    """
+    Simple baseline: Predict using the mean of historical labels.
+    No learnable parameters, just computes the average of past labels.
+    """
+    def __init__(
+        self,
+        channels: int,
+        num_classes: int = 1,
+    ):
+        super().__init__()
+        
+        self.channels = channels
+        self.num_classes = num_classes
+    
+    def forward(self, batch: Dict[str, Tensor]) -> Tensor:
+        """
+        Forward pass using mean of historical labels.
+        
+        Args:
+            batch: Dictionary containing:
+                - input_labels: (batch, window_size) - history labels
+                - input_mask: (batch, window_size) - True for valid, False for padding
+                - (other fields ignored)
+        
+        Returns:
+            logits: (batch, num_classes) - mean of historical labels
+        """
+        batch_size = batch['input_labels'].size(0)
+        device = batch['input_labels'].device
+        
+        input_labels = batch['input_labels']  # (batch, window_size)
+        input_mask = batch['input_mask']  # (batch, window_size)
+        
+        # Compute mean of valid labels for each sample
+        # Mask out padding positions
+        masked_labels = input_labels * input_mask.float()  # (batch, window_size)
+        valid_counts = input_mask.sum(dim=1, keepdim=True).float()  # (batch, 1)
+        
+        # Compute mean (handle division by zero for cold-start samples)
+        label_sum = masked_labels.sum(dim=1, keepdim=True)  # (batch, 1)
+        label_mean = label_sum / (valid_counts + 1e-8)  # (batch, 1)
+        
+        # For cold-start samples (no valid history), use 0.0 as default
+        # This will predict 0.5 after sigmoid for binary classification
+        label_mean = torch.where(valid_counts > 0, label_mean, torch.zeros_like(label_mean))
+        
+        # Expand to (batch, num_classes) if needed
+        if self.num_classes > 1:
+            logits = label_mean.expand(batch_size, self.num_classes)
+        else:
+            logits = label_mean  # (batch, 1)
+        
+        return logits
