@@ -33,6 +33,7 @@ def analyze_results(json_path):
         row = {
             'model': setting['model'],
             'mode': setting.get('mode', 'recent'),
+            'tag': setting.get('tag', 'default'),
             'lr': setting['lr'],
             'weight_decay': setting['weight_decay'],
             'num_heads': setting['num_heads'],

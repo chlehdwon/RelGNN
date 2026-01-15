@@ -227,6 +227,8 @@ class RelTS_Model(nn.Module):
         
         # 4. Combine: snapshot + time + label (additive)
         x = seq_embeddings + time_emb + label_emb  # (batch, seq_len, embed_dim)
+        # x = seq_embeddings + time_emb  # (batch, seq_len, embed_dim)
+        # x = seq_embeddings + label_emb  # (batch, seq_len, embed_dim)
         
         # Apply input normalization after combining embeddings
         x = self.input_norm(x)

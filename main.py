@@ -89,6 +89,7 @@ parser.add_argument(
 )
 parser.add_argument("--verbose", action="store_true", help="Show detailed statistics (sequence stats and quartile analysis)")
 parser.add_argument("--save", action="store_true", help="Save results")
+parser.add_argument("--tag", type=str, default="default", help="Tag for the experiment")
 
 args = parser.parse_args()
 
@@ -679,6 +680,7 @@ if args.save:
     hyperparams = json.dumps({
         "model": args.model,
         "mode": args.mode,
+        "tag": args.tag,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "num_heads": args.num_heads,
