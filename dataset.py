@@ -43,6 +43,8 @@ class EntityTimeSeriesBuilder:
         dataset_name: str,
         task_name: str,
         task: EntityTask,
+        backbone: str = "relgnn",
+        use_random_embedding: bool = False,
     ):
         """
         Args:
@@ -50,14 +52,18 @@ class EntityTimeSeriesBuilder:
             dataset_name: Dataset name (e.g., rel-amazon)
             task_name: Task name (e.g., user-churn)
             task: EntityTask object for accessing labels
+            backbone: Backbone model type (e.g., relgnn, rdl, relgt)
+            use_random_embedding: If True, use random embeddings instead of pretrained embeddings
         """
         self.index_path = Path(index_path)
         self.dataset_name = dataset_name
         self.task_name = task_name
         self.task = task
+        self.backbone = backbone
+        self.use_random_embedding = use_random_embedding
         
-        # Path to snapshot directory: {index_path}/{dataset}/{task}/
-        self.snapshot_dir = self.index_path / dataset_name / task_name
+        # Path to snapshot directory: {index_path}/{backbone}/{dataset}/{task}/
+        self.snapshot_dir = self.index_path / backbone / dataset_name / task_name
         
         # Load mapping: {split_name: {(entity_id, timestamp): index}}
         self.mapping = self._load_mapping()
@@ -89,16 +95,45 @@ class EntityTimeSeriesBuilder:
         """Load embedding tensors for each split"""
         embeddings = {}
         
-        for split in ['train', 'val', 'test']:
-            embed_path = self.snapshot_dir / f"{split}.pt"
+        if self.use_random_embedding:
+            # Generate random embeddings instead of loading pretrained ones
+            # First, load one embedding file to get the shape
+            embed_path = self.snapshot_dir / "train.pt"
+            if embed_path.exists():
+                sample_embedding = torch.load(embed_path)
+                embed_dim = sample_embedding.shape[1]
+            else:
+                # Fallback: try to get dimension from any available split
+                for split in ['train', 'val', 'test']:
+                    embed_path = self.snapshot_dir / f"{split}.pt"
+                    if embed_path.exists():
+                        sample_embedding = torch.load(embed_path)
+                        embed_dim = sample_embedding.shape[1]
+                        break
+                else:
+                    raise FileNotFoundError(
+                        f"No embedding file found to determine dimension. "
+                        f"Please run indexing.py first."
+                    )
             
-            if not embed_path.exists():
-                raise FileNotFoundError(
-                    f"Embedding file not found at {embed_path}. "
-                    f"Please run indexing.py first."
+            for split in ['train', 'val', 'test']:
+                num_samples = len(self.mapping[split])
+                random_embeddings = torch.from_numpy(
+                    np.random.randn(num_samples, embed_dim).astype(np.float32)
                 )
-            
-            embeddings[split] = torch.load(embed_path)
+                embeddings[split] = random_embeddings
+        else:
+            # Load pretrained embeddings
+            for split in ['train', 'val', 'test']:
+                embed_path = self.snapshot_dir / f"{split}.pt"
+                
+                if not embed_path.exists():
+                    raise FileNotFoundError(
+                        f"Embedding file not found at {embed_path}. "
+                        f"Please run indexing.py first."
+                    )
+                
+                embeddings[split] = torch.load(embed_path)
         
         return embeddings
     

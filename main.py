@@ -32,7 +32,7 @@ from relgnn.text_embedder import GloveTextEmbedding
 from relgnn.utils import get_configs
 from relgnn.atomic_routes import get_atomic_routes
 
-from model import RelTS_Model, RelGNN_Head, EntityMeanBaseline
+from model import RelTS_Model, MLP_Head, EntityMeanBaseline
 from dataset import EntityTimeSeriesBuilder, create_ar_dataloaders, create_strict_ar_dataloaders, create_random_ar_dataloaders
 
 parser = argparse.ArgumentParser()
@@ -44,7 +44,13 @@ parser.add_argument(
     type=str,
     default=os.path.expanduser("/data/starlab/relbench_examples"),
 )
-parser.add_argument("--checkpoint_dir", type=str, default="/data/starlab/ckpts/relgnn/")
+parser.add_argument(
+    "--backbone",
+    type=str,
+    default="relgnn",
+    choices=["rdl", "relgnn", "relgt"],
+    help="Backbone model type: 'rdl', 'relgnn', or 'relgt'"
+)
 parser.add_argument("--results_path", type=str, default="./results")
 parser.add_argument(
     "--index_path",
@@ -90,13 +96,19 @@ parser.add_argument(
 parser.add_argument("--verbose", action="store_true", help="Show detailed statistics (sequence stats and quartile analysis)")
 parser.add_argument("--save", action="store_true", help="Save results")
 parser.add_argument("--tag", type=str, default="default", help="Tag for the experiment")
+parser.add_argument("--random_embedding", action="store_true", help="Use random embeddings instead of pretrained embeddings (for ablation)")
 
 args = parser.parse_args()
 
-checkpoint_path = Path(args.checkpoint_dir) / f"{args.dataset}_{args.task}.pth"
+# Construct checkpoint path: /data/relts/ckpts/{backbone}/{dataset}_{task}.pth
+checkpoint_path = Path(f"/data/relts/ckpts/{args.backbone}") / f"{args.dataset}_{args.task}.pth"
 if not checkpoint_path.exists():
-    checkpoint_path = Path(hf_hub_download(repo_id="tianlangchen/RelGNN", filename=f"{args.dataset}_{args.task}.pth", cache_dir=args.checkpoint_dir))
-assert checkpoint_path.exists(), "Checkpoint not found. Please download the checkpoint first."
+    # Fallback to HuggingFace Hub download for relgnn
+    if args.backbone == "relgnn":
+        checkpoint_path = Path(hf_hub_download(repo_id="tianlangchen/RelGNN", filename=f"{args.dataset}_{args.task}.pth", cache_dir=f"/data/relts/ckpts/{args.backbone}"))
+    else:
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}. Please ensure the checkpoint is available for backbone={args.backbone}")
+assert checkpoint_path.exists(), f"Checkpoint not found at {checkpoint_path}. Please download the checkpoint first."
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if torch.cuda.is_available():
@@ -106,7 +118,7 @@ seed_everything(args.seed)
 dataset: Dataset = get_dataset(args.dataset, download=True)
 task: EntityTask = get_task(args.dataset, args.task, download=True)
 
-model_config, loader_config = get_configs(args.dataset, args.task)
+model_config, loader_config = get_configs(args.dataset, args.task, args.backbone)
 
 stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
 try:
@@ -185,6 +197,8 @@ builder = EntityTimeSeriesBuilder(
     dataset_name=args.dataset,
     task_name=args.task,
     task=task,
+    backbone=args.backbone,
+    use_random_embedding=args.random_embedding,
 )
 
 # Get channel dimension from snapshot embeddings
@@ -200,7 +214,12 @@ for split in ['train', 'val', 'test']:
 if channels is None:
     raise ValueError("Could not determine embedding dimension from snapshots")
 
-print(f"\nModel embedding dimension (from snapshot): {channels}")
+if args.random_embedding:
+    print(f"\n⚠️  Using RANDOM embeddings instead of pretrained embeddings!")
+    print(f"Model embedding dimension: {channels}")
+    print("="*80 + "\n")
+else:
+    print(f"\nModel embedding dimension (from snapshot): {channels}")
 
 # Print sequence length statistics (only if verbose)
 if args.verbose:
@@ -279,23 +298,22 @@ if args.model == 'relts':
     print(f"  Model: RelTS (Temporal Sequence Model)")
     print(f"    Embedding dim: {channels}")
 elif args.model == 'snapshot':
-    # Use RelGNN's head structure for direct parameter loading
-    model = RelGNN_Head(
+    # Use backbone model's head structure for direct parameter loading
+    model = MLP_Head(
         channels=channels,
         num_classes=out_channels,
-        dropout=args.dropout,
-        use_relgnn_head=True,
     ).to(device)
-    print(f"  Model: Snapshot-Only Baseline (with RelGNN head structure)")
+    print(f"  Model: Snapshot-Only Baseline (with {args.backbone} head structure)")
     print(f"    Embedding dim: {channels}")
     
-    # Load pre-trained head parameters from RelGNN checkpoint
+    # Load pre-trained head parameters from backbone checkpoint
     print(f"  Loading pre-trained head from: {checkpoint_path}")
-    relgnn_state_dict = torch.load(checkpoint_path, map_location=device)
+    backbone_state_dict = torch.load(checkpoint_path, map_location=device)
     
     # Extract head parameters (head.lins.0.weight, head.lins.0.bias)
-    head_state_dict = {k: v for k, v in relgnn_state_dict.items() if k.startswith('head.')}
-    print(f"  ✓ Loaded {len(head_state_dict)} head parameters from pre-trained RelGNN")
+    head_state_dict = {k: v for k, v in backbone_state_dict.items() if k.startswith('head.')}
+    model.load_state_dict(head_state_dict, strict=False)
+    print(f"  ✓ Loaded {len(head_state_dict)} head parameters from pre-trained {args.backbone}")
 elif args.model == 'entity_mean':
     # Simple baseline: no learnable parameters, just uses mean of historical labels
     model = EntityMeanBaseline(
@@ -679,6 +697,7 @@ if args.save:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     hyperparams = json.dumps({
         "model": args.model,
+        "backbone": args.backbone,
         "mode": args.mode,
         "tag": args.tag,
         "lr": args.lr,

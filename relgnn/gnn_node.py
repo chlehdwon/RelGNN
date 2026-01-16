@@ -24,10 +24,10 @@ from relbench.modeling.utils import get_stype_proposal
 from relbench.tasks import get_task
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dataset", type=str, default="rel-event")
-parser.add_argument("--task", type=str, default="user-attendance")
+parser.add_argument("--dataset", type=str, default="rel-f1")
+parser.add_argument("--task", type=str, default="driver-top3")
 parser.add_argument("--lr", type=float, default=0.005)
-parser.add_argument("--epochs", type=int, default=10)
+parser.add_argument("--epochs", type=int, default=20)
 parser.add_argument("--batch_size", type=int, default=512)
 parser.add_argument("--channels", type=int, default=128)
 parser.add_argument("--aggr", type=str, default="sum")
@@ -40,7 +40,7 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument(
     "--cache_dir",
     type=str,
-    default=os.path.expanduser("~/.cache/relbench_examples"),
+    default=os.path.expanduser("/data/starlab/relbench_examples"),
 )
 args = parser.parse_args()
 
@@ -187,25 +187,76 @@ model = Model(
     norm="batch_norm",
 ).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+# Setup checkpoint directory
+checkpoint_dir = Path("/data/relts/ckpts/rdl")
+checkpoint_dir.mkdir(parents=True, exist_ok=True)
+checkpoint_path = checkpoint_dir / f"{args.dataset}_{args.task}.pth"
+
 state_dict = None
 best_val_metric = -math.inf if higher_is_better else math.inf
+best_epoch = 0
+patience = 5
+patience_counter = 0
+
 for epoch in range(1, args.epochs + 1):
+    print(f"\nEpoch {epoch}/{args.epochs}")
+    print("-" * 80)
+    
     train_loss = train()
     val_pred = test(loader_dict["val"])
     val_metrics = task.evaluate(val_pred, task.get_table("val"))
-    print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
+    val_metric = val_metrics[tune_metric]
+    
+    print(f"Train loss: {train_loss:.4f}")
+    print(f"Val metrics: {val_metrics}")
+    print(f"Val {tune_metric}: {val_metric:.4f}")
 
-    if (higher_is_better and val_metrics[tune_metric] >= best_val_metric) or (
-        not higher_is_better and val_metrics[tune_metric] <= best_val_metric
-    ):
-        best_val_metric = val_metrics[tune_metric]
+    # Check if this is the best model
+    is_best = (higher_is_better and val_metric > best_val_metric) or (
+        not higher_is_better and val_metric < best_val_metric
+    )
+    
+    if is_best:
+        best_val_metric = val_metric
+        best_epoch = epoch
+        patience_counter = 0
         state_dict = copy.deepcopy(model.state_dict())
+        # Save checkpoint
+        torch.save(state_dict, checkpoint_path)
+        print(f"✓ New best model! (epoch {epoch}, {tune_metric}={val_metric:.4f})")
+        print(f"✓ Checkpoint saved to {checkpoint_path}")
+    else:
+        patience_counter += 1
+        print(f"No improvement for {patience_counter} epoch(s)")
+    
+    # Early stopping
+    if patience_counter >= patience:
+        print(f"\nEarly stopping triggered! No improvement for {patience} epochs.")
+        print(f"Best model was at epoch {best_epoch} with {tune_metric}={best_val_metric:.4f}")
+        break
 
+print("\n" + "="*80)
+print(f"Training completed!")
+print(f"Best epoch: {best_epoch}")
+print(f"Best val {tune_metric}: {best_val_metric:.4f}")
+print("="*80)
 
-model.load_state_dict(state_dict)
+# Load best model and evaluate
+if state_dict is not None:
+    model.load_state_dict(state_dict)
+else:
+    # Fallback: load from checkpoint file if state_dict wasn't saved
+    if checkpoint_path.exists():
+        print(f"Loading checkpoint from {checkpoint_path}")
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict)
+    else:
+        print("Warning: No checkpoint found, using current model state")
+
 val_pred = test(loader_dict["val"])
 val_metrics = task.evaluate(val_pred, task.get_table("val"))
-print(f"Best Val metrics: {val_metrics}")
+print(f"\nBest Val metrics: {val_metrics}")
 
 test_pred = test(loader_dict["test"])
 test_metrics = task.evaluate(test_pred)

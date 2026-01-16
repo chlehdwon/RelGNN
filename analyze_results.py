@@ -19,8 +19,18 @@ def analyze_results(json_path):
     for setting_str, timestamps in results.items():
         for timestamp, result in timestamps.items():
             seed = result['seed']
-            roc_auc = result['test_metrics']['roc_auc']
-            setting_results[setting_str][seed].append(roc_auc)
+            # Handle different metric names based on task type
+            test_metrics = result['test_metrics']
+            if 'roc_auc' in test_metrics:
+                metric_value = test_metrics['roc_auc']
+            elif 'mae' in test_metrics:
+                metric_value = test_metrics['mae']
+            elif 'multilabel_auprc_macro' in test_metrics:
+                metric_value = test_metrics['multilabel_auprc_macro']
+            else:
+                # Fallback to first metric
+                metric_value = list(test_metrics.values())[0]
+            setting_results[setting_str][seed].append(metric_value)
     
     # Calculate statistics
     rows = []
@@ -32,6 +42,7 @@ def analyze_results(json_path):
         
         row = {
             'model': setting['model'],
+            'backbone': setting.get('backbone', 'relgnn'),
             'mode': setting.get('mode', 'recent'),
             'tag': setting.get('tag', 'default'),
             'lr': setting['lr'],
@@ -40,15 +51,17 @@ def analyze_results(json_path):
             'num_layers': setting['num_layers'],
             'dropout': setting['dropout'],
             'window_size': setting['window_size'],
-            'mean_roc_auc': np.mean(seed_means),
-            'std_roc_auc': np.std(seed_means, ddof=1) if len(seed_means) > 1 else 0.0,
+            'mean_metric': np.mean(seed_means),
+            'std_metric': np.std(seed_means, ddof=1) if len(seed_means) > 1 else 0.0,
             'num_seeds': len(seed_means)
         }
         rows.append(row)
     
     # Create DataFrame and sort by mean ROC-AUC
     df = pd.DataFrame(rows)
-    df = df.sort_values('mean_roc_auc', ascending=False).reset_index(drop=True)
+    # Determine sort order based on metric name (if available)
+    # For now, assume higher is better (roc_auc)
+    df = df.sort_values('mean_metric', ascending=False).reset_index(drop=True)
     
     # Save to CSV (same directory as JSON)
     output_csv = Path(json_path).parent / f"{Path(json_path).stem}_summary.csv"
@@ -69,7 +82,7 @@ def analyze_results(json_path):
     print(f"Number of Layers: {best['num_layers']}")
     print(f"Dropout: {best['dropout']}")
     print(f"Window Size: {best['window_size']}")
-    print(f"\nMean ROC-AUC: {best['mean_roc_auc']:.6f} ± {best['std_roc_auc']:.6f}")
+    print(f"\nMean Metric: {best['mean_metric']:.6f} ± {best['std_metric']:.6f}")
     print(f"Number of Seeds: {int(best['num_seeds'])}")
     print(f"{'='*80}")
     

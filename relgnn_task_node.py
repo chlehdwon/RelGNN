@@ -39,10 +39,15 @@ parser.add_argument("--checkpoint_dir", type=str, default="/data/starlab/ckpts/r
 
 args = parser.parse_args()
 
-checkpoint_path = Path(args.checkpoint_dir) / f"{args.dataset}_{args.task}.pth"
+# Construct checkpoint path: /data/relts/ckpts/{backbone_model}/{dataset}_{task}.pth
+checkpoint_path = Path(f"/data/relts/ckpts/relgnn") / f"{args.dataset}_{args.task}.pth"
 if not checkpoint_path.exists():
-    checkpoint_path = Path(hf_hub_download(repo_id="tianlangchen/RelGNN", filename=f"{args.dataset}_{args.task}.pth", cache_dir=args.checkpoint_dir))
-assert checkpoint_path.exists(), "Checkpoint not found. Please download the checkpoint first."
+    # Fallback to HuggingFace Hub download for relgnn
+    if args.backbone_model == "relgnn":
+        checkpoint_path = Path(hf_hub_download(repo_id="tianlangchen/RelGNN", filename=f"{args.dataset}_{args.task}.pth", cache_dir=f"/data/relts/ckpts/{args.backbone_model}"))
+    else:
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}. Please ensure the checkpoint is available for backbone_model={args.backbone_model}")
+assert checkpoint_path.exists(), f"Checkpoint not found at {checkpoint_path}. Please download the checkpoint first."
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if torch.cuda.is_available():

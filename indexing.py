@@ -23,6 +23,7 @@ from relbench.modeling.utils import get_stype_proposal
 from relbench.tasks import get_task
 
 from relgnn.relgnn_model import RelGNN_Model
+from relgnn.model import Model
 from relgnn.text_embedder import GloveTextEmbedding
 from relgnn.utils import get_configs
 from relgnn.atomic_routes import get_atomic_routes
@@ -36,7 +37,13 @@ parser.add_argument(
     type=str,
     default=os.path.expanduser("/data/starlab/relbench_examples"),
 )
-parser.add_argument("--checkpoint_dir", type=str, default="/data/starlab/ckpts/relgnn/")
+parser.add_argument(
+    "--backbone",
+    type=str,
+    default="relgnn",
+    choices=["rdl", "relgnn", "relgt"],
+    help="Backbone model type: 'rdl', 'relgnn', or 'relgt'"
+)
 parser.add_argument(
     "--index_path",
     type=str,
@@ -46,10 +53,14 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-checkpoint_path = Path(args.checkpoint_dir) / f"{args.dataset}_{args.task}.pth"
+checkpoint_path = Path(f"/data/relts/ckpts/{args.backbone}") / f"{args.dataset}_{args.task}.pth"
 if not checkpoint_path.exists():
-    checkpoint_path = Path(hf_hub_download(repo_id="tianlangchen/RelGNN", filename=f"{args.dataset}_{args.task}.pth", cache_dir=args.checkpoint_dir))
-assert checkpoint_path.exists(), "Checkpoint not found. Please download the checkpoint first."
+    # Fallback to HuggingFace Hub download for relgnn
+    if args.backbone == "relgnn":
+        checkpoint_path = Path(hf_hub_download(repo_id="tianlangchen/RelGNN", filename=f"{args.dataset}_{args.task}.pth", cache_dir=f"/data/relts/ckpts/{args.backbone}"))
+    else:
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}. Please ensure the checkpoint is available for backbone={args.backbone}")
+assert checkpoint_path.exists(), f"Checkpoint not found at {checkpoint_path}. Please download the checkpoint first."
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if torch.cuda.is_available():
@@ -59,7 +70,7 @@ seed_everything(42)
 dataset: Dataset = get_dataset(args.dataset, download=True)
 task: EntityTask = get_task(args.dataset, args.task, download=True)
 
-model_config, loader_config = get_configs(args.dataset, args.task)
+model_config, loader_config = get_configs(args.dataset, args.task, args.backbone)
 
 stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
 try:
@@ -278,26 +289,33 @@ def save_all_snapshots(loader_dict: Dict[str, NeighborLoader], base_dir: Path):
     print(f"Total snapshots: {sum(len(m) for m in all_mappings.values())}")
 
 
-atomic_routes_list = get_atomic_routes(data.edge_types)
-
-model = RelGNN_Model(
-    data=data,
-    col_stats_dict=col_stats_dict,
-    out_channels=out_channels,
-    norm="batch_norm",
-    atomic_routes=atomic_routes_list,
-    **model_config,
-).to(device)
+if args.backbone == "relgnn":
+    atomic_routes_list = get_atomic_routes(data.edge_types)
+    model = RelGNN_Model(
+        data=data,
+        col_stats_dict=col_stats_dict,
+        out_channels=out_channels,
+        norm="batch_norm",
+        atomic_routes=atomic_routes_list,
+        **model_config,
+    ).to(device)
+elif args.backbone == "rdl":
+    model = Model(
+        data=data,
+        col_stats_dict=col_stats_dict,
+        out_channels=out_channels,
+        norm="batch_norm",
+        **model_config,
+    ).to(device)
 
 state_dict = torch.load(checkpoint_path)
 model.load_state_dict(state_dict)
 
-# Create output directory for snapshots: {index_path}/snapshots/{dataset}/{task}/
-snapshot_base_dir = Path(args.index_path) / args.dataset / args.task
+snapshot_base_dir = Path(args.index_path) / args.backbone / args.dataset / args.task
 print(f"\nSaving snapshots to {snapshot_base_dir}")
 
 # Save all snapshots and create mapping
 save_all_snapshots(loader_dict, snapshot_base_dir)
 
 print("\nSnapshot indexing complete!")
-print(f"Structure: {snapshot_base_dir}/{{train,val,test}}/snapshot_*.pt")
+print(f"Structure: {snapshot_base_dir}/{{train.pt,val.pt,test.pt,mapping.json}}")

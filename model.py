@@ -6,6 +6,7 @@ from typing import List, Dict, Any
 from torch import Tensor
 from torch_geometric.typing import NodeType
 from torch_geometric.nn import PositionalEncoding
+from torch_geometric.nn import MLP
 
 
 class HeteroTemporalEncoder(torch.nn.Module):
@@ -229,6 +230,7 @@ class RelTS_Model(nn.Module):
         x = seq_embeddings + time_emb + label_emb  # (batch, seq_len, embed_dim)
         # x = seq_embeddings + time_emb  # (batch, seq_len, embed_dim)
         # x = seq_embeddings + label_emb  # (batch, seq_len, embed_dim)
+        # x = time_emb + label_emb 
         
         # Apply input normalization after combining embeddings
         x = self.input_norm(x)
@@ -266,54 +268,32 @@ class RelTS_Model(nn.Module):
         return logits
 
 
-class RelGNN_Head(nn.Module):
+class MLP_Head(nn.Module):
     """
     Baseline model: Predict directly from snapshot embedding only.
     No temporal encoding, no label encoding, no sequence modeling.
-    Equivalent to RelGNN's self.head for ablation comparison.
     """
     def __init__(
         self,
         channels: int,
         num_classes: int = 1,
-        dropout: float = 0.1,
-        use_relgnn_head: bool = False,
+        norm: str = None,
     ):
         super().__init__()
         
         self.channels = channels
         self.num_classes = num_classes
-        self.use_relgnn_head = use_relgnn_head
-        
-        if use_relgnn_head:
-            # Simple linear head (exactly matching RelGNN's MLP with num_layers=1)
-            # Structure: head.lins.0 (Linear layer)
-            from torch_geometric.nn import MLP
-            self.head = MLP(
-                in_channels=channels,
-                hidden_channels=None,
-                out_channels=num_classes,
-                num_layers=1,
-                norm=None,
-            )
-        else:
-            # More sophisticated head for standalone training
-            self.head = nn.Sequential(
-                nn.Linear(channels, channels),
-                nn.LayerNorm(channels),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(channels, num_classes),
-            )
-    
+        self.head = MLP(
+            channels,
+            out_channels=num_classes,
+            norm=norm,
+            num_layers=1,
+        )
+
     def reset_parameters(self):
         """Reset all learnable parameters."""
         if hasattr(self.head, 'reset_parameters'):
             self.head.reset_parameters()
-        else:
-            for module in self.head:
-                if hasattr(module, 'reset_parameters'):
-                    module.reset_parameters()
     
     def forward(self, batch: Dict[str, Tensor]) -> Tensor:
         """
