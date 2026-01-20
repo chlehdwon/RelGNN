@@ -111,13 +111,6 @@ parser.add_argument(
     choices=["unsup", "sup"],
     help="Retrieval training type: 'unsup' (InfoNCE) or 'sup' (SupCon)",
 )
-parser.add_argument(
-    "--raw_samples_path",
-    type=str,
-    default="/data/relts/sequences/",
-    help="Path to load/save raw AR samples (before retrieval)",
-)
-
 args = parser.parse_args()
 
 # Construct checkpoint path: /data/relts/ckpts/{backbone}/{dataset}_{task}.pth
@@ -282,7 +275,6 @@ if args.mode == "recent":
         retrieval_manager=retrieval_manager,
         top_k=args.top_k,
         retrieval_batch_size=args.retrieval_batch_size,
-        save_raw_samples_path=f"{args.raw_samples_path}/{args.backbone}/{args.dataset}/{args.task}",
     )
 elif args.mode == "random":
     print("Using 'random' mode (random sampling per epoch):")

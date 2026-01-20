@@ -275,39 +275,6 @@ class EntityTimeSeriesBuilder:
         """
         return self.entity_sequences[split], self.split_indices[split]
     
-    def save_entity_sequences(self, output_path: str):
-        """
-        Save entity sequences and split indices to disk for faster loading later.
-        
-        Args:
-            output_path: Path to save the sequences
-        """
-        output_path = Path(output_path)
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        for split, sequences in self.entity_sequences.items():
-            # Convert to saveable format
-            save_data = {
-                'sequences': {},
-                'split_indices': self.split_indices[split],
-            }
-            
-            for entity_id, events in sequences.items():
-                # Unpack all events at once (single pass)
-                timestamps, embeddings, labels, entity_embeddings = zip(*events)
-                
-                save_data['sequences'][entity_id] = {
-                    'timestamps': list(timestamps),
-                    'embeddings': np.stack(embeddings),
-                    'labels': list(labels),
-                    'entity_embeddings': np.stack(entity_embeddings),
-                }
-            
-            # Save as pytorch file
-            save_path = output_path / f"{split}_sequences.pt"
-            torch.save(save_data, save_path)
-
-
 def _augment_sequence_with_retrieval(
     input_seq: List[Tuple[float, np.ndarray, float, np.ndarray]],
     target: Tuple[float, np.ndarray, float, np.ndarray],
@@ -862,7 +829,6 @@ def create_ar_dataloaders(
     retrieval_manager=None,
     top_k: int = 0,
     retrieval_batch_size: int = 256,
-    save_raw_samples_path: Optional[str] = None,
 ) -> Dict[str, DataLoader]:
     """
     Create DataLoaders for auto-regressive training.
@@ -878,8 +844,6 @@ def create_ar_dataloaders(
         retrieval_manager: Optional retrieval manager for sequence augmentation
         top_k: Number of neighbors to retrieve for augmentation
         retrieval_batch_size: Batch size for retrieval operations (default: 256)
-        save_raw_samples_path: Path to load/save raw samples (before retrieval)
-    
     Returns:
         Dict with 'train', 'val', 'test' DataLoaders
     """
@@ -896,7 +860,6 @@ def create_ar_dataloaders(
             retrieval_manager=retrieval_manager,
             top_k=top_k,
             retrieval_batch_size=retrieval_batch_size,
-            save_raw_samples_path=save_raw_samples_path,
         )
         
         # Create dataset
@@ -989,7 +952,6 @@ def create_autoregressive_samples(
     retrieval_manager=None,
     top_k: int = 0,
     retrieval_batch_size: int = 256,
-    save_raw_samples_path: Optional[str] = None,
 ) -> List[Dict]:
     """
     Create auto-regressive training samples using sliding window with padding.
@@ -1009,8 +971,6 @@ def create_autoregressive_samples(
         retrieval_manager: Optional retrieval manager for sequence augmentation
         top_k: Number of neighbors to retrieve for augmentation
         retrieval_batch_size: Batch size for retrieval operations
-        save_raw_samples_path: Path to load/save raw samples (before retrieval)
-    
     Returns:
         List of samples, each containing:
             - entity_id: int
@@ -1024,107 +984,91 @@ def create_autoregressive_samples(
             - target_label: float
             - target_entity_embedding: (entity_embed_dim,)
     """
-    # Phase 1: Create all samples without augmentation (or load if cached)
+    # Phase 1: Create all samples without augmentation
     samples_with_metadata = []
-    raw_samples_loaded = False
-    save_path = None
-    if save_raw_samples_path is not None:
-        base_dir = Path(save_raw_samples_path)
-        save_path = base_dir / f"{split_name}_raw_samples.pt"
-        if save_path.exists():
-            samples_with_metadata = torch.load(save_path)
-            raw_samples_loaded = True
-            print(f"Loaded raw samples from {save_path}")
-    
-    if not raw_samples_loaded:
-        for entity_id, sequence in tqdm(
-            entity_sequences.items(),
-            desc=f"Creating AR samples ({split_name})",
-            total=len(entity_sequences),
-        ):
-            seq_len = len(sequence)
+    for entity_id, sequence in tqdm(
+        entity_sequences.items(),
+        desc=f"Creating AR samples ({split_name})",
+        total=len(entity_sequences),
+    ):
+        seq_len = len(sequence)
+        
+        # Skip empty sequences
+        if seq_len < 1:
+            continue
+        
+        # Get embedding dimension from first event in sequence
+        embed_dim = sequence[0][1].shape[0]
+        entity_embed_dim = sequence[0][3].shape[0]
+        
+        # Determine target range for this split
+        indices = split_indices[entity_id]
+        if split_name == 'train':
+            target_start = 0
+            target_end = indices['train_end']
+        elif split_name == 'val':
+            target_start = indices['train_end']
+            target_end = indices['val_end']
+        else:  # test
+            target_start = indices['val_end']
+            target_end = seq_len
+        
+        # Create samples only for targets in this split's range
+        for target_idx in range(target_start, target_end):
+            # Input: all previous timesteps up to target_idx (max window_size)
+            # This includes data from previous splits!
+            start_idx = max(0, target_idx - window_size)
+            input_seq = sequence[start_idx:target_idx]
             
-            # Skip empty sequences
-            if seq_len < 1:
+            # Extract input data
+            input_len = len(input_seq)
+            
+            # Target: position target_idx (guaranteed to be in current split)
+            target = sequence[target_idx]
+
+            # Skip samples with insufficient input length
+            if input_len < min_input_length:
                 continue
             
-            # Get embedding dimension from first event in sequence
-            embed_dim = sequence[0][1].shape[0]
-            entity_embed_dim = sequence[0][3].shape[0]
+            # Create padded arrays
+            input_timestamps = np.zeros(window_size, dtype=np.float32)
+            input_embeddings = np.zeros((window_size, embed_dim), dtype=np.float32)
+            input_labels = np.zeros(window_size, dtype=np.float32)
+            input_entity_embeddings = np.zeros((window_size, entity_embed_dim), dtype=np.float32)
+            input_mask = np.zeros(window_size, dtype=bool)
             
-            # Determine target range for this split
-            indices = split_indices[entity_id]
-            if split_name == 'train':
-                target_start = 0
-                target_end = indices['train_end']
-            elif split_name == 'val':
-                target_start = indices['train_end']
-                target_end = indices['val_end']
-            else:  # test
-                target_start = indices['val_end']
-                target_end = seq_len
+            # Fill with actual data (left-aligned: padding on the right)
+            # This ensures position 0 always has valid data if input_len > 0
+            if input_len > 0:
+                # Unpack all at once (single pass through input_seq)
+                ts, embs, lbls, ent_embs = zip(*input_seq)
+                input_timestamps[:input_len] = ts
+                input_embeddings[:input_len] = np.stack(embs)
+                input_labels[:input_len] = lbls
+                input_entity_embeddings[:input_len] = np.stack(ent_embs)
+                input_mask[:input_len] = True
             
-            # Create samples only for targets in this split's range
-            for target_idx in range(target_start, target_end):
-                # Input: all previous timesteps up to target_idx (max window_size)
-                # This includes data from previous splits!
-                start_idx = max(0, target_idx - window_size)
-                input_seq = sequence[start_idx:target_idx]
-                
-                # Extract input data
-                input_len = len(input_seq)
-                
-                # Target: position target_idx (guaranteed to be in current split)
-                target = sequence[target_idx]
-
-                # Skip samples with insufficient input length
-                if input_len < min_input_length:
-                    continue
-                
-                # Create padded arrays
-                input_timestamps = np.zeros(window_size, dtype=np.float32)
-                input_embeddings = np.zeros((window_size, embed_dim), dtype=np.float32)
-                input_labels = np.zeros(window_size, dtype=np.float32)
-                input_entity_embeddings = np.zeros((window_size, entity_embed_dim), dtype=np.float32)
-                input_mask = np.zeros(window_size, dtype=bool)
-                
-                # Fill with actual data (left-aligned: padding on the right)
-                # This ensures position 0 always has valid data if input_len > 0
-                if input_len > 0:
-                    # Unpack all at once (single pass through input_seq)
-                    ts, embs, lbls, ent_embs = zip(*input_seq)
-                    input_timestamps[:input_len] = ts
-                    input_embeddings[:input_len] = np.stack(embs)
-                    input_labels[:input_len] = lbls
-                    input_entity_embeddings[:input_len] = np.stack(ent_embs)
-                    input_mask[:input_len] = True
-                
-                # Extract target data
-                target_timestamp = target[0]
-                target_embedding = target[1]
-                target_label = target[2]
-                target_entity_embedding = target[3]
-                
-                sample = {
-                    'entity_id': entity_id,
-                    'input_timestamps': input_timestamps,
-                    'input_embeddings': input_embeddings,
-                    'input_labels': input_labels,
-                    'input_entity_embeddings': input_entity_embeddings,
-                    'input_mask': input_mask,
-                    'target_timestamp': target_timestamp,
-                    'target_embedding': target_embedding,
-                    'target_label': target_label,
-                    'target_entity_embedding': target_entity_embedding,
-                }
-                
-                # Store with metadata for potential augmentation
-                samples_with_metadata.append((sample, input_seq, target))
-        
-        if save_path is not None:
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(samples_with_metadata, save_path)
-            print(f"Saved raw samples to {save_path}")
+            # Extract target data
+            target_timestamp = target[0]
+            target_embedding = target[1]
+            target_label = target[2]
+            target_entity_embedding = target[3]
+            
+            sample = {
+                'entity_id': entity_id,
+                'input_timestamps': input_timestamps,
+                'input_embeddings': input_embeddings,
+                'input_labels': input_labels,
+                'input_entity_embeddings': input_entity_embeddings,
+                'input_mask': input_mask,
+                'target_timestamp': target_timestamp,
+                'target_embedding': target_embedding,
+                'target_label': target_label,
+                'target_entity_embedding': target_entity_embedding,
+            }
+            
+            # Store with metadata for potential augmentation
+            samples_with_metadata.append((sample, input_seq, target))
 
     # Phase 2: Batch augmentation if needed
     if retrieval_manager is not None and top_k > 0:
