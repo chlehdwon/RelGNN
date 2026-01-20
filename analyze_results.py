@@ -51,6 +51,7 @@ def analyze_results(json_path):
             'num_layers': setting['num_layers'],
             'dropout': setting['dropout'],
             'window_size': setting['window_size'],
+            'top_k': setting.get('top_k', None),
             'mean_metric': np.mean(seed_means),
             'std_metric': np.std(seed_means, ddof=1) if len(seed_means) > 1 else 0.0,
             'num_seeds': len(seed_means)

@@ -11,7 +11,6 @@ import torch
 from torch.nn import BCEWithLogitsLoss, L1Loss
 from torch_frame import stype
 from torch_frame.config.text_embedder import TextEmbedderConfig
-from torch_geometric.loader import NeighborLoader
 from torch_geometric.seed import seed_everything
 from tqdm import tqdm
 import os
@@ -22,18 +21,19 @@ import matplotlib.pyplot as plt
 
 from relbench.base import Dataset, EntityTask, TaskType
 from relbench.datasets import get_dataset
-from relbench.modeling.graph import get_node_train_table_input, make_pkey_fkey_graph
+from relbench.modeling.graph import make_pkey_fkey_graph
 from relbench.modeling.utils import get_stype_proposal
 from relbench.tasks import get_task
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, mean_absolute_error, mean_squared_error, r2_score
 
-from relgnn.relgnn_model import RelGNN_Model
 from relgnn.text_embedder import GloveTextEmbedding
-from relgnn.utils import get_configs
-from relgnn.atomic_routes import get_atomic_routes
 
 from model import RelTS_Model, MLP_Head, EntityMeanBaseline
-from dataset import EntityTimeSeriesBuilder, create_ar_dataloaders, create_strict_ar_dataloaders, create_random_ar_dataloaders
+from util import analyze_by_sequence_length, plot_quartile_results
+from retrieval_sup import RetrievalManager as SupRetrievalManager
+from retrieval_unsup import RetrievalManager as UnsupRetrievalManager
+from dataset import EntityTimeSeriesBuilder, create_ar_dataloaders, create_random_ar_dataloaders
+from dataset_ret import RetrievalDataset, retrieval_collate_fn
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", type=str, default="rel-f1")
@@ -90,13 +90,33 @@ parser.add_argument(
     "--mode",
     type=str,
     default="recent",
-    choices=["recent", "random", "strict"],
-    help="Sampling mode: 'recent' (standard temporal, default), 'random' (random samples per epoch), 'strict' (strict temporal boundaries)"
+    choices=["recent", "random"],
+    help="Sampling mode: 'recent' (standard temporal, default), 'random' (random samples per epoch)"
 )
 parser.add_argument("--verbose", action="store_true", help="Show detailed statistics (sequence stats and quartile analysis)")
 parser.add_argument("--save", action="store_true", help="Save results")
 parser.add_argument("--tag", type=str, default="default", help="Tag for the experiment")
 parser.add_argument("--random_embedding", action="store_true", help="Use random embeddings instead of pretrained embeddings (for ablation)")
+
+# Retrieval related arguments
+parser.add_argument("--retrieval_epochs", type=int, default=5, help="Number of epochs for retrieval pre-training")
+parser.add_argument("--top_k", type=int, default=5, help="Number of retrieved contexts")
+parser.add_argument("--retrieval_lr", type=float, default=1e-3, help="Learning rate for retrieval pre-training")
+parser.add_argument("--retrieval_batch_size", type=int, default=2048, help="Batch size for retrieval operations")
+parser.add_argument("--random_retrieval", action="store_true", help="Use random retrieval instead of similarity search")
+parser.add_argument(
+    "--retrieval_type",
+    type=str,
+    default="unsup",
+    choices=["unsup", "sup"],
+    help="Retrieval training type: 'unsup' (InfoNCE) or 'sup' (SupCon)",
+)
+parser.add_argument(
+    "--raw_samples_path",
+    type=str,
+    default="/data/relts/sequences/",
+    help="Path to load/save raw AR samples (before retrieval)",
+)
 
 args = parser.parse_args()
 
@@ -117,8 +137,6 @@ seed_everything(args.seed)
 
 dataset: Dataset = get_dataset(args.dataset, download=True)
 task: EntityTask = get_task(args.dataset, args.task, download=True)
-
-model_config, loader_config = get_configs(args.dataset, args.task, args.backbone)
 
 stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
 try:
@@ -171,27 +189,6 @@ train_table = task.get_table("train")
 val_table = task.get_table("val")
 test_table = task.get_table("test", mask_input_cols=False)
 
-# Create loaders for train, val and test
-loader_dict: Dict[str, NeighborLoader] = {}
-for split in ["train", "val", "test"]:
-    table = task.get_table(split)
-    table_input = get_node_train_table_input(table=table, task=task)
-    entity_table = table_input.nodes[0]
-    loader_dict[split] = NeighborLoader(
-        data,
-        num_neighbors=[int(loader_config['num_neighbors'] / 2**i) for i in range(loader_config['num_layers'])],
-        time_attr="time",
-        input_nodes=table_input.nodes,
-        input_time=table_input.time,
-        transform=table_input.transform,
-        subgraph_type=loader_config['subgraph_type'],
-        batch_size=loader_config['batch_size'],
-        temporal_strategy="last",  
-        shuffle=split == "train", 
-        num_workers=args.num_workers,
-        persistent_workers=args.num_workers > 0,
-    )
-
 builder = EntityTimeSeriesBuilder(
     index_path=args.index_path,
     dataset_name=args.dataset,
@@ -215,7 +212,7 @@ if channels is None:
     raise ValueError("Could not determine embedding dimension from snapshots")
 
 if args.random_embedding:
-    print(f"\n⚠️  Using RANDOM embeddings instead of pretrained embeddings!")
+    print(f"\nUsing RANDOM embeddings instead of pretrained embeddings!")
     print(f"Model embedding dimension: {channels}")
     print("="*80 + "\n")
 else:
@@ -240,24 +237,55 @@ if args.verbose:
             print(f"  Std sequence length: {np.std(seq_lengths):.2f}")
     print("="*80 + "\n")
 
-# Get entity sequences and split indices from builder
-# Note: builder already has .entity_sequences and .split_indices as attributes
-# Choose dataloader creation function based on mode
+retrieval_manager = None
+if args.top_k > 0:
+    retrieval_dataset = RetrievalDataset(builder.entity_sequences['train'])
+    retrieval_loader = torch.utils.data.DataLoader(
+        retrieval_dataset, 
+        batch_size=args.batch_size,
+        shuffle=True, 
+        collate_fn=retrieval_collate_fn,
+        num_workers=0
+    )
+
+    retrieval_cls = SupRetrievalManager if args.retrieval_type == "sup" else UnsupRetrievalManager
+    retrieval_manager = retrieval_cls(
+        input_dim=channels,
+        device=device,
+        lr=args.retrieval_lr,
+        embed_dim=128,
+        use_random_retrieval=args.random_retrieval
+    )
+
+    if args.retrieval_epochs > 0:
+        for r_epoch in range(1, args.retrieval_epochs + 1):
+            r_loss = retrieval_manager.train_epoch(retrieval_loader)
+            print(f" [Retrieval] Epoch {r_epoch} | Loss: {r_loss:.4f}")
+
+    retrieval_loader = torch.utils.data.DataLoader(
+        retrieval_dataset, 
+        batch_size=args.batch_size * 4,
+        shuffle=True, 
+        collate_fn=retrieval_collate_fn
+    )
+    retrieval_manager.build_index(retrieval_loader)
+
 if args.mode == "recent":
     print("Using 'recent' mode (standard temporal setting):")
-    print("  - Input from all previous history")
     ar_loader_dict = create_ar_dataloaders(
         entity_sequences=builder.entity_sequences,
         split_indices=builder.split_indices,
         window_size=args.window_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        min_input_length=0, 
+        min_input_length=0,
+        retrieval_manager=retrieval_manager,
+        top_k=args.top_k,
+        retrieval_batch_size=args.retrieval_batch_size,
+        save_raw_samples_path=f"{args.raw_samples_path}/{args.backbone}/{args.dataset}/{args.task}",
     )
 elif args.mode == "random":
     print("Using 'random' mode (random sampling per epoch):")
-    print("  - Each epoch generates different random samples")
-    print("  - Input from all previous history")
     ar_loader_dict = create_random_ar_dataloaders(
         entity_sequences=builder.entity_sequences,
         split_indices=builder.split_indices,
@@ -266,21 +294,10 @@ elif args.mode == "random":
         num_workers=args.num_workers,
         min_input_length=0,
         samples_per_epoch=None,  # Use all possible samples
-        use_strict=False,  # Use standard temporal boundaries
         seed=args.seed,
-    )
-elif args.mode == "strict":
-    print("Using 'strict' mode (strict temporal split boundaries):")
-    print("  - Train: input from train history only")
-    print("  - Val: input from train split only")
-    print("  - Test: input from train + val splits only")
-    ar_loader_dict = create_strict_ar_dataloaders(
-        entity_sequences=builder.entity_sequences,
-        split_indices=builder.split_indices,
-        window_size=args.window_size,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        min_input_length=0, 
+        retrieval_manager=retrieval_manager,
+        top_k=args.top_k,
+        retrieval_batch_size=args.retrieval_batch_size,
     )
 else:
     raise ValueError(f"Unknown mode: {args.mode}")
@@ -348,7 +365,7 @@ def train(model, loader, optimizer, loss_fn, device):
         # Move batch to device
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                  for k, v in batch.items()}
-        
+
         # Forward pass
         logits = model(batch)
         target = batch['target_label']
@@ -390,11 +407,10 @@ def evaluate(model, loader, loss_fn, device, return_sequence_lengths=False, retu
         # Move batch to device
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                  for k, v in batch.items()}
-        
-        # Forward pass
+
         logits = model(batch)
         target = batch['target_label']
-        
+
         # Track sequence lengths (number of valid inputs)
         if return_sequence_lengths:
             seq_lengths = batch['input_mask'].sum(dim=1).cpu().numpy()  # (batch_size,)
@@ -445,146 +461,6 @@ def evaluate(model, loader, loss_fn, device, return_sequence_lengths=False, retu
         return avg_loss, metrics_dict
     else:
         return tuple(return_values)
-
-
-def analyze_by_sequence_length(all_preds, all_targets, all_seq_lengths, task_type):
-    """
-    Analyze performance by sequence length quartiles.
-    Samples are sorted by sequence length and divided into 4 equal groups.
-    
-    Args:
-        all_preds: Predictions array
-        all_targets: Ground truth targets array
-        all_seq_lengths: Sequence lengths array
-        task_type: Task type (BINARY_CLASSIFICATION, REGRESSION, etc.)
-    
-    Returns:
-        Dict with quartile analysis results
-    """
-    # Sort by sequence length
-    sorted_indices = np.argsort(all_seq_lengths)
-    sorted_preds = all_preds[sorted_indices]
-    sorted_targets = all_targets[sorted_indices]
-    sorted_seq_lengths = all_seq_lengths[sorted_indices]
-    
-    # Divide into 4 equal groups
-    n_samples = len(all_preds)
-    q1_end = n_samples // 4
-    q2_end = n_samples // 2
-    q3_end = 3 * n_samples // 4
-    
-    # Create quartile indices
-    q1_indices = np.arange(0, q1_end)
-    q2_indices = np.arange(q1_end, q2_end)
-    q3_indices = np.arange(q2_end, q3_end)
-    q4_indices = np.arange(q3_end, n_samples)
-    
-    quartiles = [
-        ("Q1 (Shortest)", q1_indices),
-        ("Q2", q2_indices),
-        ("Q3", q3_indices),
-        ("Q4 (Longest)", q4_indices),
-    ]
-    
-    results = {}
-    
-    print("\n" + "="*80)
-    print("Performance by Sequence Length Quartiles (Equal-sized groups)")
-    print("="*80)
-    
-    for quartile_name, indices in quartiles:
-        if len(indices) == 0:
-            continue
-        
-        q_preds = sorted_preds[indices]
-        q_targets = sorted_targets[indices]
-        q_seq_lengths = sorted_seq_lengths[indices]
-        
-        # Calculate metric by quartile
-        if task_type == TaskType.BINARY_CLASSIFICATION:
-            # Use ROC-AUC for binary classification
-            # Note: ROC-AUC is undefined if there is only one class present
-            if len(np.unique(q_targets)) < 2:
-                metric_name = "roc_auc"
-                metric_value = float("nan")
-            else:
-                metric_name = "roc_auc"
-                metric_value = roc_auc_score(q_targets, q_preds)
-        elif task_type == TaskType.REGRESSION:
-            # For regression, use accuracy based on threshold (or use MAE)
-            # For now, we'll use a simple threshold-based accuracy
-            # You might want to adjust this based on your needs
-            threshold = np.median(all_targets)
-            metric_name = "accuracy"
-            metric_value = accuracy_score(
-                (q_targets > threshold).astype(int),
-                (q_preds > threshold).astype(int)
-            )
-        else:
-            # For multilabel, use accuracy
-            metric_name = "accuracy"
-            metric_value = accuracy_score(q_targets, (q_preds > 0.5).astype(int))
-        
-        quartile_metrics = {
-            metric_name: metric_value,
-            "seq_min": float(q_seq_lengths.min()) if len(q_seq_lengths) > 0 else float("nan"),
-            "seq_max": float(q_seq_lengths.max()) if len(q_seq_lengths) > 0 else float("nan"),
-            "seq_avg": float(q_seq_lengths.mean()) if len(q_seq_lengths) > 0 else float("nan"),
-        }
-        results[quartile_name] = quartile_metrics
-        
-        print(f"\n{quartile_name}:")
-        print(f"  Samples: {len(q_preds)} ({100*len(q_preds)/n_samples:.1f}%)")
-        print(f"  Sequence length: {q_seq_lengths.min():.0f} - {q_seq_lengths.max():.0f} (avg: {q_seq_lengths.mean():.2f})")
-        print(f"  {metric_name.upper()}: {metric_value:.4f}")
-    
-    print("="*80 + "\n")
-    
-    return results
-
-
-def plot_quartile_results(quartile_results, save_path):
-    """
-    Create a simple line plot showing the metric trend across quartiles.
-    Only uses the single metric present in quartile_results entries.
-    """
-    # Extract metric name and values in quartile order
-    ordered = ["Q1 (Shortest)", "Q2", "Q3", "Q4 (Longest)"]
-    x_labels = []
-    y_values = []
-    metric_name = None
-    
-    for name in ordered:
-        if name not in quartile_results:
-            continue
-        metrics = quartile_results[name]
-        if not metric_name:
-            # Get the sole metric key
-            metric_name = next(k for k in metrics.keys() if not k.startswith("seq_"))
-        value = metrics.get(metric_name, float("nan"))
-        seq_min = metrics.get("seq_min", float("nan"))
-        seq_max = metrics.get("seq_max", float("nan"))
-        label = f"{name.split()[0]} ({int(seq_min)}-{int(seq_max)})"
-        x_labels.append(label)  # e.g., Q1 (0-0)
-        y_values.append(value)
-    
-    if not x_labels or metric_name is None:
-        print("No quartile results to plot.")
-        return
-    
-    plt.figure(figsize=(6, 4))
-    plt.plot(x_labels, y_values, marker="o")
-    plt.title(f"{metric_name.upper()} by Sequence Length Quartile")
-    plt.xlabel("Quartile")
-    plt.ylabel(metric_name.upper())
-    plt.ylim(0.0, 1.0) if metric_name == "roc_auc" else None
-    plt.grid(True, linestyle="--", alpha=0.5)
-    
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-    print(f"Quartile line plot saved to: {save_path}")
 
 # Training loop (skip for models that don't need training)
 if args.model in ['entity_mean']:
@@ -661,7 +537,7 @@ if args.verbose:
         test_preds, test_targets, test_seq_lengths, task.task_type
     )
     # Plot quartile trend as a line plot
-    plot_path = Path(args.results_path) / f"{args.dataset}_{args.task}_quartiles.png"
+    plot_path = Path(args.results_path) / f"{args.dataset}_{args.task}_quartiles_{args.top_k}.png"
     plot_quartile_results(quartile_results, plot_path)
 else:
     test_loss, test_metrics = evaluate(
@@ -706,6 +582,7 @@ if args.save:
         "num_layers": args.num_layers,
         "dropout": args.dropout,
         "window_size": args.window_size,
+        "top_k": args.top_k,
     })
     result_entry = {
         "seed": args.seed,

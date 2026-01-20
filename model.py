@@ -117,6 +117,7 @@ class RelTS_Model(nn.Module):
         # Use HeteroTemporalEncoder (node_types not used in our case)
         self.temporal_encoder = HeteroTemporalEncoder(node_types=[], channels=channels)
         self.label_embedder = LabelEmbedder(channels)
+
         
         # Input normalization after combining embeddings
         self.input_norm = nn.LayerNorm(channels)
@@ -182,7 +183,8 @@ class RelTS_Model(nn.Module):
         logits = torch.zeros(batch_size, self.num_classes, device=device)
         
         if (~has_context).any():
-            cold_start_logits = self.classifier(batch['target_embedding'][~has_context])
+            target_emb = batch['target_embedding'][~has_context]
+            cold_start_logits = self.classifier(target_emb)
             logits[~has_context] = cold_start_logits
         
         # For samples with context: use full transformer
@@ -225,12 +227,10 @@ class RelTS_Model(nn.Module):
         seed_time = batch['target_timestamp']  # (batch,)
         time_emb = self.temporal_encoder(seed_time, seq_timestamps)  # (batch, seq_len, embed_dim)
         label_emb = self.label_embedder(seq_labels, is_mask=is_mask)  # (batch, seq_len, embed_dim)
-        
+
+        # 3b. Add entity embeddings if provided
         # 4. Combine: snapshot + time + label (additive)
         x = seq_embeddings + time_emb + label_emb  # (batch, seq_len, embed_dim)
-        # x = seq_embeddings + time_emb  # (batch, seq_len, embed_dim)
-        # x = seq_embeddings + label_emb  # (batch, seq_len, embed_dim)
-        # x = time_emb + label_emb 
         
         # Apply input normalization after combining embeddings
         x = self.input_norm(x)

@@ -50,6 +50,11 @@ parser.add_argument(
     default="/data/relts/snapshots",
     help="Root path for saving snapshot indices"
 )
+parser.add_argument(
+    "--entity_only",
+    action="store_true",
+    help="If set, only save entity embeddings and entity_mapping.json",
+)
 
 args = parser.parse_args()
 
@@ -264,6 +269,82 @@ def create_snapshot_index(loader: NeighborLoader, split_name: str, base_dir: Pat
     return mapping
 
 
+@torch.no_grad()
+def create_entity_embedding_index(
+    loaders: Dict[str, NeighborLoader],
+    base_dir: Path,
+    num_entities: int,
+):
+    """
+    Create per-entity embedding index using pretrained encoder embeddings.
+
+    Args:
+        loaders: Dictionary of loaders for each split
+        base_dir: Base directory to save entity.pt file
+        num_entities: Total number of entities for the target table
+    """
+    entity_embeddings = None  # Full-size tensor for lookup by original id
+    seen_mask = torch.zeros(num_entities, dtype=torch.bool)
+
+    print("\nCreating entity embedding index...")
+    model.eval()
+
+    for split_name, loader in loaders.items():
+        print(f"Collecting entities from {split_name} split...")
+        for batch in tqdm(loader):
+            batch_device = batch.to(device)
+
+            # Root entity ids for this batch
+            entity_count = batch_device[task.entity_table].batch_size
+            entity_node_indices = batch_device[task.entity_table].n_id[:entity_count]
+            entity_node_indices_cpu = entity_node_indices.cpu()
+
+            # Skip if all entities already processed
+            if seen_mask[entity_node_indices_cpu].all():
+                continue
+
+            # Pretrained entity embedding from encoder (before temporal/GNN)
+            x_dict = model.encoder(batch_device.tf_dict)
+            batch_entity_embeddings = x_dict[task.entity_table][:entity_count]
+
+            # Initialize storage tensor on first use
+            if entity_embeddings is None:
+                embed_dim = batch_entity_embeddings.size(-1)
+                entity_embeddings = torch.full(
+                    (num_entities, embed_dim),
+                    float("nan"),
+                    device="cpu",
+                )
+
+            # Fill only unseen entities
+            unseen_mask = ~seen_mask[entity_node_indices_cpu]
+            if unseen_mask.any():
+                unseen_indices = entity_node_indices_cpu[unseen_mask]
+                entity_embeddings[unseen_indices] = batch_entity_embeddings[unseen_mask].cpu()
+                seen_mask[unseen_indices] = True
+
+    # Save entity embeddings to entity.pt (compact, unique only)
+    if entity_embeddings is None:
+        raise RuntimeError("No entity embeddings were collected. Check loader or task settings.")
+
+    seen_indices = torch.nonzero(seen_mask).view(-1).tolist()
+    if len(seen_indices) == 0:
+        raise RuntimeError("No entities were seen in any loader.")
+
+    compact_embeddings = entity_embeddings[seen_indices]
+    embeddings_path = base_dir / "entity.pt"
+    torch.save(compact_embeddings, embeddings_path)
+
+    num_seen = int(seen_mask.sum().item())
+    print(f"Saved {num_seen} entity embeddings to {embeddings_path}")
+    if num_seen < num_entities:
+        print(f"Warning: {num_entities - num_seen} entities were not seen in any loader.")
+
+    # Build mapping for entities that were seen in this split
+    entity_mapping = {str(entity_id): idx for idx, entity_id in enumerate(seen_indices)}
+    return entity_mapping
+
+
 def save_all_snapshots(loader_dict: Dict[str, NeighborLoader], base_dir: Path):
     """
     Save snapshots and mapping for all splits.
@@ -275,18 +356,33 @@ def save_all_snapshots(loader_dict: Dict[str, NeighborLoader], base_dir: Path):
     base_dir.mkdir(parents=True, exist_ok=True)
     
     all_mappings = {}
+
+    if not args.entity_only:
+        for split_name, loader in loader_dict.items():
+            mapping = create_snapshot_index(loader, split_name, base_dir)
+            all_mappings[split_name] = mapping
     
-    for split_name, loader in loader_dict.items():
-        mapping = create_snapshot_index(loader, split_name, base_dir)
-        all_mappings[split_name] = mapping
-    
-    # Save the complete mapping at the task level
-    mapping_path = base_dir / "mapping.json"
-    with open(mapping_path, "w") as f:
-        json.dump(all_mappings, f, indent=2)
-    
-    print(f"\nMapping saved to {mapping_path}")
-    print(f"Total snapshots: {sum(len(m) for m in all_mappings.values())}")
+    # Save per-entity embeddings once (use train loader by default)
+    num_entities = data[task.entity_table].num_nodes
+    entity_mapping = create_entity_embedding_index(
+        loader_dict,
+        base_dir,
+        num_entities,
+    )
+
+    # Save entity mapping separately to avoid collisions with existing mapping.json
+    entity_mapping_path = base_dir / "entity_mapping.json"
+    with open(entity_mapping_path, "w") as f:
+        json.dump(entity_mapping, f, indent=2)
+    print(f"\nEntity mapping saved to {entity_mapping_path}")
+
+    if not args.entity_only:
+        mapping_path = base_dir / "mapping.json"
+        with open(mapping_path, "w") as f:
+            json.dump(all_mappings, f, indent=2)
+        
+        print(f"Mapping saved to {mapping_path}")
+        print(f"Total snapshots: {sum(len(m) for m in all_mappings.values())}")
 
 
 if args.backbone == "relgnn":
