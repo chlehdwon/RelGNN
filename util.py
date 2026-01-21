@@ -100,6 +100,91 @@ def analyze_by_sequence_length(all_preds, all_targets, all_seq_lengths, task_typ
     return results
 
 
+def analyze_cold_start_gap(all_preds, all_targets, all_seq_lengths, task_type, top_k: int = 0):
+    """
+    Print combined analysis:
+    - Cold-start definition based on top_k (or seq_len == 0)
+    - Cold vs non-cold gap
+    - Length buckets: Cold / Short (1-5) / Long (>5)
+    """
+    if len(all_preds) == 0:
+        print("No samples available for cold-start analysis.")
+        return
+
+    if top_k > 0:
+        cold_mask = (all_seq_lengths == top_k)
+        cold_def = f"seq_len == top_k ({top_k})"
+    else:
+        cold_mask = (all_seq_lengths == 0)
+        cold_def = "seq_len == 0"
+
+    non_cold_mask = ~cold_mask
+
+    def _compute_metric(preds, targets):
+        if task_type == TaskType.BINARY_CLASSIFICATION:
+            if len(np.unique(targets)) < 2:
+                return "roc_auc", float("nan")
+            return "roc_auc", roc_auc_score(targets, preds)
+        elif task_type == TaskType.REGRESSION:
+            threshold = np.median(all_targets)
+            return "accuracy", accuracy_score(
+                (targets > threshold).astype(int),
+                (preds > threshold).astype(int)
+            )
+        else:
+            return "accuracy", accuracy_score(targets, (preds > 0.5).astype(int))
+
+    print("\n" + "=" * 80)
+    print("Cold-Start vs Non-Cold-Start Performance")
+    print("=" * 80)
+    print(f"Cold-start definition: {cold_def}")
+
+    cold_count = int(cold_mask.sum())
+    non_cold_count = int(non_cold_mask.sum())
+    print(f"Cold-start samples: {cold_count} / {len(all_preds)}")
+    print(f"Non-cold-start samples: {non_cold_count} / {len(all_preds)}")
+
+    if task_type == TaskType.BINARY_CLASSIFICATION:
+        if cold_count > 0:
+            cold_pos_ratio = float(np.mean(all_targets[cold_mask] > 0.5))
+            print(f"Cold-start positive ratio: {cold_pos_ratio:.4f}")
+        else:
+            print("Cold-start positive ratio: None")
+        if non_cold_count > 0:
+            non_cold_pos_ratio = float(np.mean(all_targets[non_cold_mask] > 0.5))
+            print(f"Non-cold-start positive ratio: {non_cold_pos_ratio:.4f}")
+        else:
+            print("Non-cold-start positive ratio: None")
+
+    if cold_count == 0 or non_cold_count == 0:
+        metric_name, _ = _compute_metric(
+            all_preds[cold_mask] if cold_count > 0 else all_preds[non_cold_mask],
+            all_targets[cold_mask] if cold_count > 0 else all_targets[non_cold_mask]
+        )
+        if cold_count == 0:
+            print(f"Cold-start {metric_name.upper()}: None")
+        if non_cold_count == 0:
+            print(f"Non-cold-start {metric_name.upper()}: None")
+        print("Gap (non-cold - cold): None")
+    else:
+        cold_metric_name, cold_metric_value = _compute_metric(
+            all_preds[cold_mask], all_targets[cold_mask]
+        )
+        non_cold_metric_name, non_cold_metric_value = _compute_metric(
+            all_preds[non_cold_mask], all_targets[non_cold_mask]
+        )
+
+        if cold_metric_name != non_cold_metric_name:
+            print("Metric mismatch between groups; skipping gap report.")
+        else:
+            gap = non_cold_metric_value - cold_metric_value
+            print(f"Cold-start {cold_metric_name.upper()}: {cold_metric_value:.4f}")
+            print(f"Non-cold-start {non_cold_metric_name.upper()}: {non_cold_metric_value:.4f}")
+            print(f"Gap (non-cold - cold): {gap:.4f}")
+
+    print("=" * 80 + "\n")
+
+
 def plot_quartile_results(quartile_results, save_path):
     """
     Create a simple line plot showing the metric trend across quartiles.

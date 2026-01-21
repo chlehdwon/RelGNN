@@ -102,6 +102,8 @@ class RelTS_Model(nn.Module):
     def __init__(
         self,
         channels: int,
+        entity_embed_dim: int = None,
+        use_entity_embedding: bool = False,
         num_heads: int = 4,
         num_layers: int = 4,
         ff_dim: int = 512,
@@ -117,6 +119,12 @@ class RelTS_Model(nn.Module):
         # Use HeteroTemporalEncoder (node_types not used in our case)
         self.temporal_encoder = HeteroTemporalEncoder(node_types=[], channels=channels)
         self.label_embedder = LabelEmbedder(channels)
+        if not use_entity_embedding or entity_embed_dim is None:
+            self.entity_proj = None
+        elif entity_embed_dim == channels:
+            self.entity_proj = nn.Identity()
+        else:
+            self.entity_proj = nn.Linear(entity_embed_dim, channels)
 
         
         # Input normalization after combining embeddings
@@ -152,6 +160,8 @@ class RelTS_Model(nn.Module):
         self.input_norm.reset_parameters()
         # label_embedder doesn't have reset_parameters, will use default init
         # transformer will use default init
+        if self.entity_proj is not None and hasattr(self.entity_proj, 'reset_parameters'):
+            self.entity_proj.reset_parameters()
         for module in self.classifier:
             if hasattr(module, 'reset_parameters'):
                 module.reset_parameters()
@@ -184,6 +194,9 @@ class RelTS_Model(nn.Module):
         
         if (~has_context).any():
             target_emb = batch['target_embedding'][~has_context]
+            if self.entity_proj is not None and 'target_entity_embedding' in batch:
+                target_entity_emb = batch['target_entity_embedding'][~has_context]
+                target_emb = target_emb + self.entity_proj(target_entity_emb)
             cold_start_logits = self.classifier(target_emb)
             logits[~has_context] = cold_start_logits
         
@@ -229,6 +242,12 @@ class RelTS_Model(nn.Module):
         label_emb = self.label_embedder(seq_labels, is_mask=is_mask)  # (batch, seq_len, embed_dim)
 
         # 3b. Add entity embeddings if provided
+        if self.entity_proj is not None and 'input_entity_embeddings' in batch and 'target_entity_embedding' in batch:
+            seq_entity_embeddings = torch.cat([
+                batch['input_entity_embeddings'],
+                batch['target_entity_embedding'].unsqueeze(1)
+            ], dim=1)
+            seq_embeddings = seq_embeddings + self.entity_proj(seq_entity_embeddings)
         # 4. Combine: snapshot + time + label (additive)
         x = seq_embeddings + time_emb + label_emb  # (batch, seq_len, embed_dim)
         

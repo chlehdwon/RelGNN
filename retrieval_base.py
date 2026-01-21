@@ -49,11 +49,12 @@ class BaseRetrievalManager:
     """
     Shared retrieval logic for indexing and querying.
     """
-    def __init__(self, model, device, optimizer, use_random_retrieval: bool = False):
+    def __init__(self, model, device, optimizer, use_random_retrieval: bool = False, use_entity_embedding: bool = True):
         self.device = device
         self.model = model.to(device)
         self.optimizer = optimizer
         self.use_random_retrieval = use_random_retrieval
+        self.use_entity_embedding = use_entity_embedding
 
         self.memory_bank = None
         self.faiss_index = None
@@ -76,14 +77,19 @@ class BaseRetrievalManager:
 
         with torch.no_grad():
             for batch in loader:
-                x = batch['embedding'].to(self.device)
+                context_emb = batch['embedding'].to(self.device)
+                if self.use_entity_embedding and 'entity_embedding' in batch:
+                    entity_emb = batch['entity_embedding'].to(self.device)
+                    x = torch.cat([context_emb, entity_emb], dim=1)
+                else:
+                    x = context_emb
                 t = batch['timestamp'].to(self.device).view(-1, 1)
 
                 feat = self._encode_features(x, t)
                 feat = F.normalize(feat, dim=1)
                 embeddings.append(feat.cpu())
 
-                x_cpu = x.cpu()
+                x_cpu = context_emb.cpu()
                 t_cpu = t.cpu()
                 labels = batch.get('label', None)
                 labels_cpu = labels.cpu() if labels is not None else None
@@ -115,7 +121,12 @@ class BaseRetrievalManager:
 
     def retrieve(self, query_batch, k=5, alpha=0.5):
         self.model.eval()
-        x = query_batch['target_embedding']
+        context_emb = query_batch['target_embedding']
+        if self.use_entity_embedding and 'target_entity_embedding' in query_batch:
+            entity_emb = query_batch['target_entity_embedding']
+            x = torch.cat([context_emb, entity_emb], dim=1)
+        else:
+            x = context_emb
 
         if self.memory_bank is None or len(self.metadata) == 0:
             raise ValueError("Memory bank is empty. Run build_index() first.")

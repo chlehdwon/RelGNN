@@ -66,7 +66,7 @@ class SupConLoss(nn.Module):
 
 class Contextretrieval(nn.Module):
     """
-    Encoder Network: (Entity_Context + Time) -> Retrieval Embedding
+    Encoder Network: (Context + Entity + Time) -> Retrieval Embedding
     This maps a specific entity state at a specific time to a vector space.
     """
     def __init__(self, input_dim, embed_dim=128, projection_dim=128):
@@ -93,7 +93,7 @@ class Contextretrieval(nn.Module):
     def forward(self, x, t):
         """
         Args:
-            x: Context features [Batch, Input_Dim]
+            x: Context + entity features [Batch, Input_Dim]
             t: Time features [Batch, 1]
         Returns:
             feat: Representation for retrieval [Batch, Embed_Dim]
@@ -118,10 +118,17 @@ class RetrievalManager(BaseRetrievalManager):
         lr=1e-3,
         embed_dim=128,
         use_random_retrieval: bool = False,
+        use_entity_embedding: bool = True,
     ):
         model = Contextretrieval(input_dim, embed_dim)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        super().__init__(model=model, device=device, optimizer=optimizer, use_random_retrieval=use_random_retrieval)
+        super().__init__(
+            model=model,
+            device=device,
+            optimizer=optimizer,
+            use_random_retrieval=use_random_retrieval,
+            use_entity_embedding=use_entity_embedding,
+        )
         self.criterion = SupConLoss().to(device)
         self.use_faiss = True
 
@@ -131,7 +138,12 @@ class RetrievalManager(BaseRetrievalManager):
         steps = 0
         
         for batch in tqdm(loader, desc="[retrieval] Training"):
-            x = batch['embedding'].to(self.device)
+            context_emb = batch['embedding'].to(self.device)
+            if self.use_entity_embedding and 'entity_embedding' in batch:
+                entity_emb = batch['entity_embedding'].to(self.device)
+                x = torch.cat([context_emb, entity_emb], dim=1)
+            else:
+                x = context_emb
             y = batch['label'].to(self.device).view(-1)
             t = batch['timestamp'].to(self.device).view(-1, 1)
 

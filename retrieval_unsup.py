@@ -52,7 +52,7 @@ class ContextRetrieval(nn.Module):
         
         # [Core of SimCSE] Dropout is ESSENTIAL here.
         # It creates the "augmentation" (noise) needed for self-supervised learning.
-        self.dropout_rate = 0.1 
+        self.dropout_rate = 0.1
         
         self.encoder = nn.Sequential(
             nn.Linear(input_dim + 32, 256), # Input + Time
@@ -66,7 +66,7 @@ class ContextRetrieval(nn.Module):
     def forward(self, x, t):
         t_emb = self.time_encoder(t)
         
-        # Combine Context (x) and Time (t)
+        # Combine Context + Entity (x) and Time (t)
         # This makes the embedding "Time-Aware"
         combined = torch.cat([x, t_emb], dim=1)
         
@@ -82,11 +82,18 @@ class RetrievalManager(BaseRetrievalManager):
         lr=1e-4,
         embed_dim=128,
         use_random_retrieval=False,
+        use_entity_embedding: bool = True,
         **kwargs
     ):
         model = ContextRetrieval(input_dim, embed_dim)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-        super().__init__(model=model, device=device, optimizer=optimizer, use_random_retrieval=use_random_retrieval)
+        super().__init__(
+            model=model,
+            device=device,
+            optimizer=optimizer,
+            use_random_retrieval=use_random_retrieval,
+            use_entity_embedding=use_entity_embedding,
+        )
         self.criterion = InfoNCELoss(temperature=0.07).to(device)
 
     def train_epoch(self, loader):
@@ -98,7 +105,12 @@ class RetrievalManager(BaseRetrievalManager):
         steps = 0
         
         for batch in tqdm(loader, desc="[retrieval] Training (SimCSE)"):
-            x = batch['embedding'].to(self.device)
+            context_emb = batch['embedding'].to(self.device)
+            if self.use_entity_embedding and 'entity_embedding' in batch:
+                entity_emb = batch['entity_embedding'].to(self.device)
+                x = torch.cat([context_emb, entity_emb], dim=1)
+            else:
+                x = context_emb
             t = batch['timestamp'].to(self.device).view(-1, 1)
             
             # --- SimCSE Logic ---

@@ -29,7 +29,7 @@ from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, mean_absolu
 from relgnn.text_embedder import GloveTextEmbedding
 
 from model import RelTS_Model, MLP_Head, EntityMeanBaseline
-from util import analyze_by_sequence_length, plot_quartile_results
+from util import analyze_by_sequence_length, plot_quartile_results, analyze_cold_start_gap
 from retrieval_sup import RetrievalManager as SupRetrievalManager
 from retrieval_unsup import RetrievalManager as UnsupRetrievalManager
 from dataset import EntityTimeSeriesBuilder, create_ar_dataloaders, create_random_ar_dataloaders
@@ -97,6 +97,11 @@ parser.add_argument("--verbose", action="store_true", help="Show detailed statis
 parser.add_argument("--save", action="store_true", help="Save results")
 parser.add_argument("--tag", type=str, default="default", help="Tag for the experiment")
 parser.add_argument("--random_embedding", action="store_true", help="Use random embeddings instead of pretrained embeddings (for ablation)")
+parser.add_argument(
+    "--use_entity_embedding",
+    action=argparse.BooleanOptionalAction,
+    help="Use entity embeddings in model and retrieval"
+)
 
 # Retrieval related arguments
 parser.add_argument("--retrieval_epochs", type=int, default=5, help="Number of epochs for retrieval pre-training")
@@ -105,9 +110,9 @@ parser.add_argument("--retrieval_lr", type=float, default=1e-3, help="Learning r
 parser.add_argument("--retrieval_batch_size", type=int, default=2048, help="Batch size for retrieval operations")
 parser.add_argument("--random_retrieval", action="store_true", help="Use random retrieval instead of similarity search")
 parser.add_argument(
-    "--retrieval_type",
+    "--ret_type",
     type=str,
-    default="unsup",
+    default="sup",
     choices=["unsup", "sup"],
     help="Retrieval training type: 'unsup' (InfoNCE) or 'sup' (SupCon)",
 )
@@ -241,13 +246,16 @@ if args.top_k > 0:
         num_workers=0
     )
 
-    retrieval_cls = SupRetrievalManager if args.retrieval_type == "sup" else UnsupRetrievalManager
+    retrieval_cls = SupRetrievalManager if args.ret_type == "sup" else UnsupRetrievalManager
+    entity_embed_dim = builder.entity_embeddings.shape[1]
+    retrieval_input_dim = channels + entity_embed_dim if args.use_entity_embedding else channels
     retrieval_manager = retrieval_cls(
-        input_dim=channels,
+        input_dim=retrieval_input_dim,
         device=device,
         lr=args.retrieval_lr,
         embed_dim=128,
-        use_random_retrieval=args.random_retrieval
+        use_random_retrieval=args.random_retrieval,
+        use_entity_embedding=args.use_entity_embedding
     )
 
     if args.retrieval_epochs > 0:
@@ -296,8 +304,11 @@ else:
 
 # Create model based on type
 if args.model == 'relts':
+    entity_embed_dim = builder.entity_embeddings.shape[1] if args.use_entity_embedding else None
     model = RelTS_Model(
         channels=channels,
+        entity_embed_dim=entity_embed_dim,
+        use_entity_embedding=args.use_entity_embedding,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         ff_dim=args.ff_dim,
@@ -527,6 +538,9 @@ if args.verbose:
     # Analyze by sequence length quartiles
     quartile_results = analyze_by_sequence_length(
         test_preds, test_targets, test_seq_lengths, task.task_type
+    )
+    analyze_cold_start_gap(
+        test_preds, test_targets, test_seq_lengths, task.task_type, top_k=args.top_k
     )
     # Plot quartile trend as a line plot
     plot_path = Path(args.results_path) / f"{args.dataset}_{args.task}_quartiles_{args.top_k}.png"
