@@ -38,15 +38,11 @@ parser.add_argument(
 parser.add_argument("--checkpoint_dir", type=str, default="/data/starlab/ckpts/relgnn/")
 
 args = parser.parse_args()
-
+args.backbone_model = "relgnn"
 # Construct checkpoint path: /data/relts/ckpts/{backbone_model}/{dataset}_{task}.pth
 checkpoint_path = Path(f"/data/relts/ckpts/relgnn") / f"{args.dataset}_{args.task}.pth"
 if not checkpoint_path.exists():
-    # Fallback to HuggingFace Hub download for relgnn
-    if args.backbone_model == "relgnn":
-        checkpoint_path = Path(hf_hub_download(repo_id="tianlangchen/RelGNN", filename=f"{args.dataset}_{args.task}.pth", cache_dir=f"/data/relts/ckpts/{args.backbone_model}"))
-    else:
-        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}. Please ensure the checkpoint is available for backbone_model={args.backbone_model}")
+    checkpoint_path = Path(hf_hub_download(repo_id="tianlangchen/RelGNN", filename=f"{args.dataset}_{args.task}.pth", cache_dir=f"/data/relts/ckpts/relgnn"))
 assert checkpoint_path.exists(), f"Checkpoint not found at {checkpoint_path}. Please download the checkpoint first."
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -57,7 +53,7 @@ seed_everything(42)
 dataset: Dataset = get_dataset(args.dataset, download=True)
 task: EntityTask = get_task(args.dataset, args.task, download=True)
 
-model_config, loader_config = get_configs(args.dataset, args.task)
+model_config, loader_config = get_configs(args.dataset, args.task, args.backbone_model)
 
 stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
 try:
