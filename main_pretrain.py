@@ -2,22 +2,18 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict
 
 import numpy as np
 from datetime import datetime
-import pandas as pd
 import torch
 from torch.nn import BCEWithLogitsLoss, L1Loss
 from torch_frame import stype
 from torch_frame.config.text_embedder import TextEmbedderConfig
 from torch_geometric.seed import seed_everything
 from tqdm import tqdm
-import os
 from huggingface_hub import hf_hub_download
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 from relbench.base import Dataset, EntityTask, TaskType
 from relbench.datasets import get_dataset
@@ -28,12 +24,9 @@ from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, mean_absolu
 
 from relgnn.text_embedder import GloveTextEmbedding
 
-from model import RelTS_Model, MLP_Head, EntityMeanBaseline
+from model import RelTS_Model
 from util import analyze_by_sequence_length, plot_quartile_results, analyze_cold_start_gap
-from retrieval_sup import RetrievalManager as SupRetrievalManager
-from retrieval_unsup import RetrievalManager as UnsupRetrievalManager
 from dataset import EntityTimeSeriesBuilder, create_ar_dataloaders, create_random_ar_dataloaders
-from dataset_ret import RetrievalDataset, retrieval_collate_fn
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", type=str, default="rel-f1")
@@ -51,13 +44,13 @@ parser.add_argument(
     choices=["rdl", "relgnn", "relgt"],
     help="Backbone model type: 'rdl', 'relgnn', or 'relgt'"
 )
-parser.add_argument("--results_path", type=str, default="./results")
 parser.add_argument(
     "--index_path",
     type=str,
     default="/data/relts/snapshots",
     help="Root path for saving snapshot indices"
 )
+parser.add_argument("--results_path", type=str, default="/data/relts/ckpts")
 parser.add_argument(
     "--window_size",
     type=int,
@@ -80,13 +73,6 @@ parser.add_argument("--num_layers", type=int, default=4, help="Number of transfo
 parser.add_argument("--ff_dim", type=int, default=512, help="Feedforward dimension")
 parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
 parser.add_argument(
-    "--model",
-    type=str,
-    default="relts",
-    choices=["relts", "snapshot", "entity_mean"],
-    help="Model type: 'relts' (full temporal model), 'snapshot' (baseline, snapshot only), or 'entity_mean' (baseline, mean of historical labels)"
-)
-parser.add_argument(
     "--mode",
     type=str,
     default="recent",
@@ -95,27 +81,16 @@ parser.add_argument(
 )
 parser.add_argument("--verbose", action="store_true", help="Show detailed statistics (sequence stats and quartile analysis)")
 parser.add_argument("--save", action="store_true", help="Save results")
+parser.add_argument("--report", action="store_true", help="Report results")
+parser.add_argument("--report_path", type=str, default="./results")
 parser.add_argument("--tag", type=str, default="default", help="Tag for the experiment")
-parser.add_argument("--random_embedding", action="store_true", help="Use random embeddings instead of pretrained embeddings (for ablation)")
 parser.add_argument(
     "--use_entity_embedding",
     action=argparse.BooleanOptionalAction,
-    help="Use entity embeddings in model and retrieval"
+    help="Use entity embeddings in model"
 )
 
-# Retrieval related arguments
-parser.add_argument("--retrieval_epochs", type=int, default=5, help="Number of epochs for retrieval pre-training")
-parser.add_argument("--top_k", type=int, default=5, help="Number of retrieved contexts")
-parser.add_argument("--retrieval_lr", type=float, default=1e-3, help="Learning rate for retrieval pre-training")
-parser.add_argument("--retrieval_batch_size", type=int, default=2048, help="Batch size for retrieval operations")
-parser.add_argument("--random_retrieval", action="store_true", help="Use random retrieval instead of similarity search")
-parser.add_argument(
-    "--ret_type",
-    type=str,
-    default="sup",
-    choices=["unsup", "sup"],
-    help="Retrieval training type: 'unsup' (InfoNCE) or 'sup' (SupCon)",
-)
+ 
 args = parser.parse_args()
 
 # Construct checkpoint path: /data/relts/ckpts/{backbone}/{dataset}_{task}.pth
@@ -193,7 +168,7 @@ builder = EntityTimeSeriesBuilder(
     task_name=args.task,
     task=task,
     backbone=args.backbone,
-    use_random_embedding=args.random_embedding,
+    use_random_embedding=False,
 )
 
 # Get channel dimension from snapshot embeddings
@@ -209,12 +184,7 @@ for split in ['train', 'val', 'test']:
 if channels is None:
     raise ValueError("Could not determine embedding dimension from snapshots")
 
-if args.random_embedding:
-    print(f"\nUsing RANDOM embeddings instead of pretrained embeddings!")
-    print(f"Model embedding dimension: {channels}")
-    print("="*80 + "\n")
-else:
-    print(f"\nModel embedding dimension (from snapshot): {channels}")
+print(f"\nModel embedding dimension (from snapshot): {channels}")
 
 # Print sequence length statistics (only if verbose)
 if args.verbose:
@@ -235,42 +205,6 @@ if args.verbose:
             print(f"  Std sequence length: {np.std(seq_lengths):.2f}")
     print("="*80 + "\n")
 
-retrieval_manager = None
-if args.top_k > 0:
-    retrieval_dataset = RetrievalDataset(builder.entity_sequences['train'])
-    retrieval_loader = torch.utils.data.DataLoader(
-        retrieval_dataset, 
-        batch_size=args.batch_size,
-        shuffle=True, 
-        collate_fn=retrieval_collate_fn,
-        num_workers=0
-    )
-
-    retrieval_cls = SupRetrievalManager if args.ret_type == "sup" else UnsupRetrievalManager
-    entity_embed_dim = builder.entity_embeddings.shape[1]
-    retrieval_input_dim = channels + entity_embed_dim if args.use_entity_embedding else channels
-    retrieval_manager = retrieval_cls(
-        input_dim=retrieval_input_dim,
-        device=device,
-        lr=args.retrieval_lr,
-        embed_dim=128,
-        use_random_retrieval=args.random_retrieval,
-        use_entity_embedding=args.use_entity_embedding
-    )
-
-    if args.retrieval_epochs > 0:
-        for r_epoch in range(1, args.retrieval_epochs + 1):
-            r_loss = retrieval_manager.train_epoch(retrieval_loader)
-            print(f" [Retrieval] Epoch {r_epoch} | Loss: {r_loss:.4f}")
-
-    retrieval_loader = torch.utils.data.DataLoader(
-        retrieval_dataset, 
-        batch_size=args.batch_size * 4,
-        shuffle=True, 
-        collate_fn=retrieval_collate_fn
-    )
-    retrieval_manager.build_index(retrieval_loader)
-
 if args.mode == "recent":
     print("Using 'recent' mode (standard temporal setting):")
     ar_loader_dict = create_ar_dataloaders(
@@ -280,9 +214,6 @@ if args.mode == "recent":
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         min_input_length=0,
-        retrieval_manager=retrieval_manager,
-        top_k=args.top_k,
-        retrieval_batch_size=args.retrieval_batch_size,
     )
 elif args.mode == "random":
     print("Using 'random' mode (random sampling per epoch):")
@@ -295,66 +226,33 @@ elif args.mode == "random":
         min_input_length=0,
         samples_per_epoch=None,  # Use all possible samples
         seed=args.seed,
-        retrieval_manager=retrieval_manager,
-        top_k=args.top_k,
-        retrieval_batch_size=args.retrieval_batch_size,
     )
 else:
     raise ValueError(f"Unknown mode: {args.mode}")
 
 # Create model based on type
-if args.model == 'relts':
-    entity_embed_dim = builder.entity_embeddings.shape[1] if args.use_entity_embedding else None
-    model = RelTS_Model(
-        channels=channels,
-        entity_embed_dim=entity_embed_dim,
-        use_entity_embedding=args.use_entity_embedding,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        ff_dim=args.ff_dim,
-        dropout=args.dropout,
-        num_classes=out_channels,
-    ).to(device)
-    print(f"  Model: RelTS (Temporal Sequence Model)")
-    print(f"    Embedding dim: {channels}")
-elif args.model == 'snapshot':
-    # Use backbone model's head structure for direct parameter loading
-    model = MLP_Head(
-        channels=channels,
-        num_classes=out_channels,
-    ).to(device)
-    print(f"  Model: Snapshot-Only Baseline (with {args.backbone} head structure)")
-    print(f"    Embedding dim: {channels}")
-    
-    # Load pre-trained head parameters from backbone checkpoint
-    print(f"  Loading pre-trained head from: {checkpoint_path}")
-    backbone_state_dict = torch.load(checkpoint_path, map_location=device)
-    
-    # Extract head parameters (head.lins.0.weight, head.lins.0.bias)
-    head_state_dict = {k: v for k, v in backbone_state_dict.items() if k.startswith('head.')}
-    model.load_state_dict(head_state_dict, strict=False)
-    print(f"  ✓ Loaded {len(head_state_dict)} head parameters from pre-trained {args.backbone}")
-elif args.model == 'entity_mean':
-    # Simple baseline: no learnable parameters, just uses mean of historical labels
-    model = EntityMeanBaseline(
-        channels=channels,
-        num_classes=out_channels,
-    ).to(device)
-    print(f"  Model: Entity Mean Baseline (no training needed)")
-    print(f"    Embedding dim: {channels}")
-else:
-    raise ValueError(f"Unknown model type: {args.model}")
+entity_embed_dim = builder.entity_embeddings.shape[1] if args.use_entity_embedding else None
+model = RelTS_Model(
+    channels=channels,
+    entity_embed_dim=entity_embed_dim,
+    use_entity_embedding=args.use_entity_embedding,
+    num_heads=args.num_heads,
+    num_layers=args.num_layers,
+    ff_dim=args.ff_dim,
+    dropout=args.dropout,
+    num_classes=out_channels,
+).to(device)
+print(f"  Model: RelTS (Temporal Sequence Model)")
+print(f"    Embedding dim: {channels}")
 
 print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
 
 # Optimizer (only for models that need training)
-optimizer = None
-if args.model in ['relts', 'snapshot']:
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=args.lr,
+    weight_decay=args.weight_decay,
+)
 
 # Training function
 def train(model, loader, optimizer, loss_fn, device):
@@ -466,67 +364,59 @@ def evaluate(model, loader, loss_fn, device, return_sequence_lengths=False, retu
         return tuple(return_values)
 
 # Training loop (skip for models that don't need training)
-if args.model in ['entity_mean']:
-    print("\n" + "="*80)
-    if args.model == 'snapshot':
-        print("Snapshot model: Skipping training, evaluating pre-trained model directly")
-    elif args.model == 'entity_mean':
-        print("Entity Mean Baseline: Skipping training, using mean of historical labels")
-    print("="*80)
-    best_val_metric = None
-    best_epoch = 0
-else:
-    print(f"\nStarting training for {args.epochs} epochs...")
-    print("="*80)
-    print("Early stopping patience: 5 epochs")
+print(f"\nStarting training for {args.epochs} epochs...")
+print("="*80)
+print("Early stopping patience: 5 epochs")
+
+best_val_metric = -float('inf') if higher_is_better else float('inf')
+best_epoch = 0
+best_state_dict = None
+patience = 5
+patience_counter = 0
+
+for epoch in range(1, args.epochs + 1):
+    print(f"\nEpoch {epoch}/{args.epochs}")
+    print("-" * 80)
     
-    best_val_metric = -float('inf') if higher_is_better else float('inf')
-    best_epoch = 0
-    patience = 5
-    patience_counter = 0
+    # Train
+    train_loss = train(model, ar_loader_dict['train'], optimizer, loss_fn, device)
+    print(f"Train Loss: {train_loss:.4f}")
     
-    for epoch in range(1, args.epochs + 1):
-        print(f"\nEpoch {epoch}/{args.epochs}")
-        print("-" * 80)
-        
-        # Train
-        train_loss = train(model, ar_loader_dict['train'], optimizer, loss_fn, device)
-        print(f"Train Loss: {train_loss:.4f}")
-        
-        # Validate
-        val_loss, val_metrics = evaluate(model, ar_loader_dict['val'], loss_fn, device)
-        print(f"Val Loss: {val_loss:.4f}")
-        print(f"Val Metrics: {val_metrics}")
-        
-        # Get primary metric
-        val_metric = val_metrics[tune_metric]
-        print(f"Val {tune_metric}: {val_metric:.4f}")
-        
-        # Track best
-        is_best = (higher_is_better and val_metric > best_val_metric) or \
-                  (not higher_is_better and val_metric < best_val_metric)
-        
-        if is_best:
-            best_val_metric = val_metric
-            best_epoch = epoch
-            patience_counter = 0
-            print(f"✓ New best model! (epoch {epoch}, {tune_metric}={val_metric:.4f})")
-        else:
-            patience_counter += 1
-            print(f"No improvement for {patience_counter} epoch(s)")
-        
-        # Early stopping
-        if patience_counter >= patience:
-            print(f"\nEarly stopping triggered! No improvement for {patience} epochs.")
-            print(f"Best model was at epoch {best_epoch} with {tune_metric}={best_val_metric:.4f}")
-            break
+    # Validate
+    val_loss, val_metrics = evaluate(model, ar_loader_dict['val'], loss_fn, device)
+    print(f"Val Loss: {val_loss:.4f}")
+    print(f"Val Metrics: {val_metrics}")
     
-    print("\n" + "="*80)
-    print(f"Training completed!")
-    print(f"Best epoch: {best_epoch}")
-    if best_val_metric is not None:
-        print(f"Best val {tune_metric}: {best_val_metric:.4f}")
-    print("="*80)
+    # Get primary metric
+    val_metric = val_metrics[tune_metric]
+    print(f"Val {tune_metric}: {val_metric:.4f}")
+    
+    # Track best
+    is_best = (higher_is_better and val_metric > best_val_metric) or \
+              (not higher_is_better and val_metric < best_val_metric)
+    
+    if is_best:
+        best_val_metric = val_metric
+        best_epoch = epoch
+        best_state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        patience_counter = 0
+        print(f"✓ New best model! (epoch {epoch}, {tune_metric}={val_metric:.4f})")
+    else:
+        patience_counter += 1
+        print(f"No improvement for {patience_counter} epoch(s)")
+    
+    # Early stopping
+    if patience_counter >= patience:
+        print(f"\nEarly stopping triggered! No improvement for {patience} epochs.")
+        print(f"Best model was at epoch {best_epoch} with {tune_metric}={best_val_metric:.4f}")
+        break
+
+print("\n" + "="*80)
+print(f"Training completed!")
+print(f"Best epoch: {best_epoch}")
+if best_val_metric is not None:
+    print(f"Best val {tune_metric}: {best_val_metric:.4f}")
+print("="*80)
 
 # Evaluate on test set
 print("\nEvaluating on test set...")
@@ -540,10 +430,10 @@ if args.verbose:
         test_preds, test_targets, test_seq_lengths, task.task_type
     )
     analyze_cold_start_gap(
-        test_preds, test_targets, test_seq_lengths, task.task_type, top_k=args.top_k
+        test_preds, test_targets, test_seq_lengths, task.task_type
     )
     # Plot quartile trend as a line plot
-    plot_path = Path(args.results_path) / f"{args.dataset}_{args.task}_quartiles_{args.top_k}.png"
+    plot_path = Path(args.results_path) / f"{args.dataset}_{args.task}_quartiles.png"
     plot_quartile_results(quartile_results, plot_path)
 else:
     test_loss, test_metrics = evaluate(
@@ -555,8 +445,8 @@ print(f"Test {tune_metric}: {test_metrics[tune_metric]:.4f}")
 print("="*80)
 
 
-if args.save:
-    results_path = Path(args.results_path) / f"{args.dataset}_{args.task}.json"
+if args.report:
+    results_path = Path(args.report_path) / f"{args.dataset}_{args.task}.json"
     results_path.parent.mkdir(parents=True, exist_ok=True)
     # Load existing results if file exists
     if results_path.exists():
@@ -578,7 +468,6 @@ if args.save:
     # Add new result with timestamp as key
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     hyperparams = json.dumps({
-        "model": args.model,
         "backbone": args.backbone,
         "mode": args.mode,
         "tag": args.tag,
@@ -588,7 +477,6 @@ if args.save:
         "num_layers": args.num_layers,
         "dropout": args.dropout,
         "window_size": args.window_size,
-        "top_k": args.top_k,
     })
     result_entry = {
         "seed": args.seed,
@@ -604,3 +492,58 @@ if args.save:
     with open(results_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"Results saved to {results_path}")
+
+if args.save:
+    # Save best sequence model weights only
+    ckpt_root = os.path.join(args.results_path, "transformers")
+    os.makedirs(ckpt_root, exist_ok=True)
+    ckpt_name = f"{args.dataset}_{args.task}_{args.backbone}.pth"
+    ckpt_path = os.path.join(ckpt_root, ckpt_name)
+    if best_state_dict is None:
+        best_state_dict = model.state_dict()
+    torch.save(best_state_dict, ckpt_path)
+    print(f"Saved model checkpoint to: {ckpt_path}")
+
+    # Extract CLS embeddings for retrieval (sorted by target timestamp)
+    print("Extracting CLS embeddings for retrieval...")
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+    model.eval()
+
+    all_entity_ids = []
+    all_timestamps = []
+    all_cls = []
+    with torch.no_grad():
+        for split in ["train", "val", "test"]:
+            for batch in tqdm(ar_loader_dict[split], desc=f"CLS encoding ({split})"):
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                cls_emb = model.encode_cls(batch)
+                all_entity_ids.append(batch["entity_id"].detach().cpu())
+                all_timestamps.append(batch["target_timestamp"].detach().cpu())
+                all_cls.append(cls_emb.detach().cpu())
+
+    entity_ids = torch.cat(all_entity_ids, dim=0)
+    timestamps = torch.cat(all_timestamps, dim=0)
+    cls_embeddings = torch.cat(all_cls, dim=0)
+
+    order = torch.from_numpy(np.lexsort((entity_ids.numpy(), timestamps.numpy())))
+    entity_ids = entity_ids[order]
+    timestamps = timestamps[order]
+    cls_embeddings = cls_embeddings[order]
+
+    # Build (entity_id, timestamp) -> index for reverse lookup (same key format as indexing.py; float(ts) for consistent lookup in main_predict)
+    id_time_to_index = {}
+    for i in range(len(entity_ids)):
+        eid = entity_ids[i].item()
+        ts = timestamps[i].item()
+        key = f"({eid}, {float(ts)})"
+        id_time_to_index[key] = int(i)
+
+    retrieval_root = os.path.join(args.index_path, args.backbone, args.dataset, args.task)
+    os.makedirs(retrieval_root, exist_ok=True)
+    torch.save(cls_embeddings, os.path.join(retrieval_root, "cls_embeddings.pt"))
+    torch.save(entity_ids, os.path.join(retrieval_root, "cls_entity_ids.pt"))
+    torch.save(timestamps, os.path.join(retrieval_root, "cls_timestamps.pt"))
+    with open(os.path.join(retrieval_root, "cls_mapping.json"), "w") as f:
+        json.dump(id_time_to_index, f)
+    print(f"Saved CLS retrieval data to: {retrieval_root}")

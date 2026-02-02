@@ -1,12 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
-from typing import List, Dict, Any
+from typing import List, Dict
 from torch import Tensor
 from torch_geometric.typing import NodeType
 from torch_geometric.nn import PositionalEncoding
-from torch_geometric.nn import MLP
 
 
 class HeteroTemporalEncoder(torch.nn.Module):
@@ -129,6 +126,9 @@ class RelTS_Model(nn.Module):
         
         # Input normalization after combining embeddings
         self.input_norm = nn.LayerNorm(channels)
+        self.cls_emb = nn.Parameter(torch.zeros(1, 1, channels))
+        self.sep_emb = nn.Parameter(torch.zeros(1, 1, channels))
+        self.pos_encoder = PositionalEncoding(channels)
         
         # Transformer encoder
         self.transformer = nn.TransformerEncoder(
@@ -158,6 +158,9 @@ class RelTS_Model(nn.Module):
         """Reset all learnable parameters."""
         self.temporal_encoder.reset_parameters()
         self.input_norm.reset_parameters()
+        nn.init.normal_(self.cls_emb, std=0.02)
+        nn.init.normal_(self.sep_emb, std=0.02)
+        self.pos_encoder.reset_parameters()
         # label_embedder doesn't have reset_parameters, will use default init
         # transformer will use default init
         if self.entity_proj is not None and hasattr(self.entity_proj, 'reset_parameters'):
@@ -186,30 +189,11 @@ class RelTS_Model(nn.Module):
         batch_size = batch['input_embeddings'].size(0)
         device = batch['input_embeddings'].device
         
-        # Check for cold-start samples (no valid history)
-        has_context = batch['input_mask'].any(dim=1)  # (batch,) - True if any valid input
-        
-        # Handle all cases with unified logic
-        logits = torch.zeros(batch_size, self.num_classes, device=device)
-        
-        if (~has_context).any():
-            target_emb = batch['target_embedding'][~has_context]
-            if self.entity_proj is not None and 'target_entity_embedding' in batch:
-                target_entity_emb = batch['target_entity_embedding'][~has_context]
-                target_emb = target_emb + self.entity_proj(target_entity_emb)
-            cold_start_logits = self.classifier(target_emb)
-            logits[~has_context] = cold_start_logits
-        
-        # For samples with context: use full transformer
-        if has_context.any():
-            context_batch = {k: v[has_context] for k, v in batch.items() if isinstance(v, torch.Tensor)}
-            context_logits = self._forward_with_context(context_batch)
-            logits[has_context] = context_logits
-        
-        return logits
+        context_batch = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        return self._forward_with_context(context_batch)
     
-    def _forward_with_context(self, batch: Dict[str, Tensor]) -> Tensor:
-        """Forward pass for samples with valid context."""
+    def _encode_sequence(self, batch: Dict[str, Tensor]) -> Tensor:
+        """Encode sequence and return transformer outputs."""
         batch_size = batch['input_embeddings'].size(0)
         device = batch['input_embeddings'].device
         
@@ -248,37 +232,98 @@ class RelTS_Model(nn.Module):
                 batch['target_entity_embedding'].unsqueeze(1)
             ], dim=1)
             seq_embeddings = seq_embeddings + self.entity_proj(seq_entity_embeddings)
-        # 4. Combine: snapshot + time + label (additive)
-        x = seq_embeddings + time_emb + label_emb  # (batch, seq_len, embed_dim)
-        
-        # Apply input normalization after combining embeddings
-        x = self.input_norm(x)
-        
-        # 5. Create padding mask for transformer
-        # batch['input_mask']: True = valid data, False = padding
-        seq_mask = torch.cat([
-            batch['input_mask'],
-            torch.ones(batch_size, 1, dtype=torch.bool, device=device)  # Target always valid
-        ], dim=1)  # (batch, window_size + 1)
-        
-        # PyTorch transformer convention: True = ignore (padding), False = attend
-        padding_mask = ~seq_mask  # (batch, window_size + 1)
-        
-        # 6. Create causal mask
+
+        use_retrieval = 'retrieved_cls_emb' in batch and 'retrieved_labels' in batch
+        num_refs = 5
+
+        if use_retrieval:
+            # ref_tokens = retrieved_cls_emb + label_emb(retrieved_labels) + time_emb(retrieved_timestamps); (B, 5, C)
+            ref_labels = batch['retrieved_labels'].long().clamp(0, 1)  # binary for LabelEmbedder
+            ref_label_emb = self.label_embedder(ref_labels, is_mask=None)  # (B, 5, C)
+            ref_tokens = batch['retrieved_cls_emb'] + ref_label_emb
+            if 'retrieved_timestamps' in batch:
+                seed_time = batch['target_timestamp']  # (B,)
+                ref_time_emb = self.temporal_encoder(seed_time, batch['retrieved_timestamps'])  # (B, 5, C)
+                ref_tokens = ref_tokens + ref_time_emb
+            retrieved_ref_mask = batch.get('retrieved_ref_mask')
+            if retrieved_ref_mask is not None:
+                ref_tokens = ref_tokens * retrieved_ref_mask.unsqueeze(-1).float()
+            cls_emb = self.cls_emb.expand(batch_size, -1, -1)
+            sep_emb = self.sep_emb.expand(batch_size, -1, -1)
+            # [CLS] [ref_1] ... [ref_5] [SEP] [ctx1] ... [ctx_k] [target]
+            # seq_embeddings here is (B, window_size+1) = [ctx, target] (no CLS yet)
+            seq_embeddings = torch.cat([
+                cls_emb,
+                ref_tokens,
+                sep_emb,
+                seq_embeddings,  # full ctx + target
+            ], dim=1)  # (batch, 1 + 5 + 1 + window_size + 1, C)
+            time_emb = torch.cat([
+                torch.zeros(batch_size, 1, self.channels, device=device),
+                torch.zeros(batch_size, num_refs, self.channels, device=device),
+                torch.zeros(batch_size, 1, self.channels, device=device),
+                time_emb,  # (B, window_size+1)
+            ], dim=1)
+            label_emb = torch.cat([
+                torch.zeros(batch_size, 1, self.channels, device=device),
+                torch.zeros(batch_size, num_refs, self.channels, device=device),
+                torch.zeros(batch_size, 1, self.channels, device=device),
+                label_emb,  # (B, window_size+1)
+            ], dim=1)
+            ref_valid = retrieved_ref_mask if retrieved_ref_mask is not None else torch.ones(batch_size, num_refs, dtype=torch.bool, device=device)
+            seq_mask = torch.cat([
+                torch.ones(batch_size, 1, dtype=torch.bool, device=device),
+                ref_valid,
+                torch.ones(batch_size, 1, dtype=torch.bool, device=device),
+                batch['input_mask'],
+                torch.ones(batch_size, 1, dtype=torch.bool, device=device),
+            ], dim=1)
+        else:
+            # 4. Prepend [CLS] embedding (no retrieval)
+            cls_emb = self.cls_emb.expand(batch_size, -1, -1)
+            seq_embeddings = torch.cat([cls_emb, seq_embeddings], dim=1)
+            time_emb = torch.cat([torch.zeros_like(cls_emb), time_emb], dim=1)
+            label_emb = torch.cat([torch.zeros_like(cls_emb), label_emb], dim=1)
+            seq_mask = torch.cat([
+                torch.ones(batch_size, 1, dtype=torch.bool, device=device),
+                batch['input_mask'],
+                torch.ones(batch_size, 1, dtype=torch.bool, device=device),
+            ], dim=1)
+
+        # 5. Combine: snapshot + time + label (additive)
+        x = seq_embeddings + time_emb + label_emb
+
         seq_len = x.size(1)
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
-            diagonal=1
-        )  # Upper triangular = True (masked)
+        pos = torch.arange(seq_len, device=device)
+        pos_emb = self.pos_encoder(pos).unsqueeze(0).expand(batch_size, -1, -1)
+        x = x + pos_emb
+        x = self.input_norm(x)
+
+        padding_mask = ~seq_mask
         
+        # # 6. Create causal mask: position i cannot attend to j when j > i
+        # # Exception: position 0 (CLS) attends to all, so encode_cls gets full-sequence summary
+        # seq_len = x.size(1)
+        # causal_mask = torch.triu(
+        #     torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+        #     diagonal=1
+        # )
+        # causal_mask[0, :] = False  # CLS (position 0) can attend to all positions
+
         # 7. Apply transformer
         h = self.transformer(
             x,
-            mask=causal_mask,
+            # mask=causal_mask,
             src_key_padding_mask=padding_mask
         )  # (batch, seq_len, embed_dim)
         
-        # 8. Predict from last position (target)
+        return h
+
+    def _forward_with_context(self, batch: Dict[str, Tensor]) -> Tensor:
+        """Forward pass for samples with valid context."""
+        h = self._encode_sequence(batch)
+        
+        # Predict from last position (target)
         # Note: Target position can see all history but not its own label (masked)
         target_repr = h[:, -1, :]  # (batch, embed_dim)
         
@@ -286,106 +331,9 @@ class RelTS_Model(nn.Module):
         
         return logits
 
-
-class MLP_Head(nn.Module):
-    """
-    Baseline model: Predict directly from snapshot embedding only.
-    No temporal encoding, no label encoding, no sequence modeling.
-    """
-    def __init__(
-        self,
-        channels: int,
-        num_classes: int = 1,
-        norm: str = None,
-    ):
-        super().__init__()
-        
-        self.channels = channels
-        self.num_classes = num_classes
-        self.head = MLP(
-            channels,
-            out_channels=num_classes,
-            norm=norm,
-            num_layers=1,
-        )
-
-    def reset_parameters(self):
-        """Reset all learnable parameters."""
-        if hasattr(self.head, 'reset_parameters'):
-            self.head.reset_parameters()
-    
-    def forward(self, batch: Dict[str, Tensor]) -> Tensor:
-        """
-        Forward pass using only target snapshot embedding.
-        
-        Args:
-            batch: Dictionary containing:
-                - target_embedding: (batch, channels)
-                - (other fields ignored)
-        
-        Returns:
-            logits: (batch, num_classes)
-        """
-        # Use only target snapshot embedding
-        target_emb = batch['target_embedding']  # (batch, channels)
-        
-        # Direct prediction
-        logits = self.head(target_emb)  # (batch, num_classes)
-        
-        return logits
+    def encode_cls(self, batch: Dict[str, Tensor]) -> Tensor:
+        """Return CLS embedding for each sample."""
+        h = self._encode_sequence(batch)
+        return h[:, 0, :]
 
 
-class EntityMeanBaseline(nn.Module):
-    """
-    Simple baseline: Predict using the mean of historical labels.
-    No learnable parameters, just computes the average of past labels.
-    """
-    def __init__(
-        self,
-        channels: int,
-        num_classes: int = 1,
-    ):
-        super().__init__()
-        
-        self.channels = channels
-        self.num_classes = num_classes
-    
-    def forward(self, batch: Dict[str, Tensor]) -> Tensor:
-        """
-        Forward pass using mean of historical labels.
-        
-        Args:
-            batch: Dictionary containing:
-                - input_labels: (batch, window_size) - history labels
-                - input_mask: (batch, window_size) - True for valid, False for padding
-                - (other fields ignored)
-        
-        Returns:
-            logits: (batch, num_classes) - mean of historical labels
-        """
-        batch_size = batch['input_labels'].size(0)
-        device = batch['input_labels'].device
-        
-        input_labels = batch['input_labels']  # (batch, window_size)
-        input_mask = batch['input_mask']  # (batch, window_size)
-        
-        # Compute mean of valid labels for each sample
-        # Mask out padding positions
-        masked_labels = input_labels * input_mask.float()  # (batch, window_size)
-        valid_counts = input_mask.sum(dim=1, keepdim=True).float()  # (batch, 1)
-        
-        # Compute mean (handle division by zero for cold-start samples)
-        label_sum = masked_labels.sum(dim=1, keepdim=True)  # (batch, 1)
-        label_mean = label_sum / (valid_counts + 1e-8)  # (batch, 1)
-        
-        # For cold-start samples (no valid history), use 0.0 as default
-        # This will predict 0.5 after sigmoid for binary classification
-        label_mean = torch.where(valid_counts > 0, label_mean, torch.zeros_like(label_mean))
-        
-        # Expand to (batch, num_classes) if needed
-        if self.num_classes > 1:
-            logits = label_mean.expand(batch_size, self.num_classes)
-        else:
-            logits = label_mean  # (batch, 1)
-        
-        return logits

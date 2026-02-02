@@ -507,23 +507,28 @@ class ARSampleDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Get one AR sample.
-        
+
         Returns:
             Dict with tensors for input and target
         """
         sample = self.samples[idx]
-        
+
+        def _to_tensor(x, dtype):
+            if isinstance(x, torch.Tensor):
+                return x.detach().clone().to(dtype)
+            return torch.tensor(x, dtype=dtype)
+
         return {
-            'entity_id': torch.tensor(sample['entity_id'], dtype=torch.long),
-            'input_timestamps': torch.tensor(sample['input_timestamps'], dtype=torch.float32),
-            'input_embeddings': torch.tensor(sample['input_embeddings'], dtype=torch.float32),
-            'input_labels': torch.tensor(sample['input_labels'], dtype=torch.float32),
-            'input_entity_embeddings': torch.tensor(sample['input_entity_embeddings'], dtype=torch.float32),
-            'input_mask': torch.tensor(sample['input_mask'], dtype=torch.bool),
-            'target_timestamp': torch.tensor(sample['target_timestamp'], dtype=torch.float32),
-            'target_embedding': torch.tensor(sample['target_embedding'], dtype=torch.float32),
-            'target_label': torch.tensor(sample['target_label'], dtype=torch.float32),
-            'target_entity_embedding': torch.tensor(sample['target_entity_embedding'], dtype=torch.float32),
+            'entity_id': _to_tensor(sample['entity_id'], torch.long),
+            'input_timestamps': _to_tensor(sample['input_timestamps'], torch.float32),
+            'input_embeddings': _to_tensor(sample['input_embeddings'], torch.float32),
+            'input_labels': _to_tensor(sample['input_labels'], torch.float32),
+            'input_entity_embeddings': _to_tensor(sample['input_entity_embeddings'], torch.float32),
+            'input_mask': _to_tensor(sample['input_mask'], torch.bool),
+            'target_timestamp': _to_tensor(sample['target_timestamp'], torch.float32),
+            'target_embedding': _to_tensor(sample['target_embedding'], torch.float32),
+            'target_label': _to_tensor(sample['target_label'], torch.float32),
+            'target_entity_embedding': _to_tensor(sample['target_entity_embedding'], torch.float32),
         }
 
 
@@ -666,20 +671,25 @@ class RandomARSampleDataset(IterableDataset):
             )
         else:
             samples = [sample for sample, _, _ in samples_with_metadata]
-        
+
+        def _to_tensor(x, dtype):
+            if isinstance(x, torch.Tensor):
+                return x.detach().clone().to(dtype)
+            return torch.tensor(x, dtype=dtype)
+
         # Yield samples as tensors
         for sample in samples:
             yield {
-                'entity_id': torch.tensor(sample['entity_id'], dtype=torch.long),
-                'input_timestamps': torch.tensor(sample['input_timestamps'], dtype=torch.float32),
-                'input_embeddings': torch.tensor(sample['input_embeddings'], dtype=torch.float32),
-                'input_labels': torch.tensor(sample['input_labels'], dtype=torch.float32),
-                'input_entity_embeddings': torch.tensor(sample['input_entity_embeddings'], dtype=torch.float32),
-                'input_mask': torch.tensor(sample['input_mask'], dtype=torch.bool),
-                'target_timestamp': torch.tensor(sample['target_timestamp'], dtype=torch.float32),
-                'target_embedding': torch.tensor(sample['target_embedding'], dtype=torch.float32),
-                'target_label': torch.tensor(sample['target_label'], dtype=torch.float32),
-                'target_entity_embedding': torch.tensor(sample['target_entity_embedding'], dtype=torch.float32),
+                'entity_id': _to_tensor(sample['entity_id'], torch.long),
+                'input_timestamps': _to_tensor(sample['input_timestamps'], torch.float32),
+                'input_embeddings': _to_tensor(sample['input_embeddings'], torch.float32),
+                'input_labels': _to_tensor(sample['input_labels'], torch.float32),
+                'input_entity_embeddings': _to_tensor(sample['input_entity_embeddings'], torch.float32),
+                'input_mask': _to_tensor(sample['input_mask'], torch.bool),
+                'target_timestamp': _to_tensor(sample['target_timestamp'], torch.float32),
+                'target_embedding': _to_tensor(sample['target_embedding'], torch.float32),
+                'target_label': _to_tensor(sample['target_label'], torch.float32),
+                'target_entity_embedding': _to_tensor(sample['target_entity_embedding'], torch.float32),
             }
     
     def _create_sample(self, entity_id: int, target_idx: int) -> Optional[Dict]:

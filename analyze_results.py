@@ -1,4 +1,6 @@
-"""Analyze hyperparameter tuning results and export to CSV."""
+"""Analyze hyperparameter tuning results and export to CSV.
+Supports both pretrain and predict JSONs; summary CSV includes a 'stage' column (pretrain | predict).
+"""
 import json
 import argparse
 from collections import defaultdict
@@ -7,102 +9,119 @@ import numpy as np
 import pandas as pd
 
 
-def analyze_results(json_path):
-    """Analyze tuning results and create CSV summary."""
-    # Load results
-    with open(json_path, 'r') as f:
-        results = json.load(f)
-    
-    # Group by setting and seed
+def _process_one_results(results, stage):
+    """Build summary rows from one results dict. stage is 'pretrain' or 'predict'."""
     setting_results = defaultdict(lambda: defaultdict(list))
-    
     for setting_str, timestamps in results.items():
         for timestamp, result in timestamps.items():
-            seed = result['seed']
-            # Handle different metric names based on task type
-            test_metrics = result['test_metrics']
-            if 'roc_auc' in test_metrics:
-                metric_value = test_metrics['roc_auc']
-            elif 'mae' in test_metrics:
-                metric_value = test_metrics['mae']
-            elif 'multilabel_auprc_macro' in test_metrics:
-                metric_value = test_metrics['multilabel_auprc_macro']
+            seed = result["seed"]
+            test_metrics = result["test_metrics"]
+            if "roc_auc" in test_metrics:
+                metric_value = test_metrics["roc_auc"]
+            elif "mae" in test_metrics:
+                metric_value = test_metrics["mae"]
+            elif "multilabel_auprc_macro" in test_metrics:
+                metric_value = test_metrics["multilabel_auprc_macro"]
             else:
-                # Fallback to first metric
                 metric_value = list(test_metrics.values())[0]
             setting_results[setting_str][seed].append(metric_value)
-    
-    # Calculate statistics
+
     rows = []
     for setting_str, seed_dict in setting_results.items():
         setting = json.loads(setting_str)
-        
-        # Average per seed (in case of duplicates)
-        seed_means = [np.mean(values) for values in seed_dict.values()]
-        
+        seed_to_mean = {seed: np.mean(values) for seed, values in seed_dict.items()}
+        seed_means = list(seed_to_mean.values())
+        # Best seed: the seed that achieved the highest metric for this setting
+        best_seed = max(seed_to_mean.keys(), key=lambda s: seed_to_mean[s])
+        best_seed_metric = seed_to_mean[best_seed]
         row = {
-            'model': setting['model'],
-            'backbone': setting.get('backbone', 'relgnn'),
-            'mode': setting.get('mode', 'recent'),
-            'tag': setting.get('tag', 'default'),
-            'lr': setting['lr'],
-            'weight_decay': setting['weight_decay'],
-            'num_heads': setting['num_heads'],
-            'num_layers': setting['num_layers'],
-            'dropout': setting['dropout'],
-            'window_size': setting['window_size'],
-            'top_k': setting.get('top_k', None),
-            'mean_metric': np.mean(seed_means),
-            'std_metric': np.std(seed_means, ddof=1) if len(seed_means) > 1 else 0.0,
-            'num_seeds': len(seed_means)
+            "stage": stage,
+            "backbone": setting.get("backbone", "relgnn"),
+            "mode": setting.get("mode", "recent"),
+            "tag": setting.get("tag", "default"),
+            "lr": setting.get("lr"),
+            "weight_decay": setting.get("weight_decay"),
+            "num_heads": setting.get("num_heads"),
+            "num_layers": setting.get("num_layers"),
+            "dropout": setting.get("dropout"),
+            "window_size": setting.get("window_size"),
+            "top_k": setting.get("top_k"),
+            "ref_baseline": setting.get("ref_baseline"),
+            "mean_metric": np.mean(seed_means),
+            "std_metric": np.std(seed_means, ddof=1) if len(seed_means) > 1 else 0.0,
+            "num_seeds": len(seed_means),
+            "best_seed": best_seed,
+            "best_seed_metric": best_seed_metric,
         }
         rows.append(row)
-    
-    # Create DataFrame and sort by mean ROC-AUC
+    return rows
+
+
+def analyze_results(results_dir, dataset, task):
+    """Load pretrain and predict JSONs (if present), merge by stage, write one summary CSV."""
+    results_dir = Path(results_dir)
+    base_name = f"{dataset}_{task}"
+    pretrain_path = results_dir / f"{base_name}.json"
+    predict_path = results_dir / f"{base_name}_predict.json"
+
+    rows = []
+    if pretrain_path.exists():
+        with open(pretrain_path, "r") as f:
+            pretrain_results = json.load(f)
+        rows.extend(_process_one_results(pretrain_results, stage="pretrain"))
+    if predict_path.exists():
+        with open(predict_path, "r") as f:
+            predict_results = json.load(f)
+        rows.extend(_process_one_results(predict_results, stage="predict"))
+
+    if not rows:
+        print(f"Error: No result files found for {dataset}/{task}.")
+        print(f"  Looked for: {pretrain_path}, {predict_path}")
+        exit(1)
+
     df = pd.DataFrame(rows)
-    # Determine sort order based on metric name (if available)
-    # For now, assume higher is better (roc_auc)
-    df = df.sort_values('mean_metric', ascending=False).reset_index(drop=True)
-    
-    # Save to CSV (same directory as JSON)
-    output_csv = Path(json_path).parent / f"{Path(json_path).stem}_summary.csv"
-    df.to_csv(output_csv, index=False, float_format='%.6f')
-    
+    # Sort by stage (pretrain first) then by mean_metric (higher first)
+    df = df.sort_values(
+        ["stage", "mean_metric"],
+        ascending=[True, False],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    output_csv = results_dir / f"{base_name}_summary.csv"
+    df.to_csv(output_csv, index=False, float_format="%.6f")
     print(f"Results saved to: {output_csv}")
-    print(f"\nTop 10 Settings:")
-    print(df.head(10).to_string(index=False))
+
+    # Print by stage
+    for stage in df["stage"].unique():
+        subset = df[df["stage"] == stage]
+        print(f"\n--- {stage.upper()} (top 10) ---")
+        print(subset.head(10).to_string(index=False))
+
     print(f"\n{'='*80}")
-    print("BEST SETTING:")
+    print("BEST PER STAGE:")
     print(f"{'='*80}")
-    best = df.iloc[0]
-    print(f"Model: {best['model']}")
-    print(f"Mode: {best['mode']}")
-    print(f"Learning Rate: {best['lr']}")
-    print(f"Weight Decay: {best['weight_decay']}")
-    print(f"Number of Heads: {best['num_heads']}")
-    print(f"Number of Layers: {best['num_layers']}")
-    print(f"Dropout: {best['dropout']}")
-    print(f"Window Size: {best['window_size']}")
-    print(f"\nMean Metric: {best['mean_metric']:.6f} ± {best['std_metric']:.6f}")
-    print(f"Number of Seeds: {int(best['num_seeds'])}")
+    for stage in ["pretrain", "predict"]:
+        stage_df = df[df["stage"] == stage]
+        if stage_df.empty:
+            continue
+        best = stage_df.iloc[0]
+        print(f"\n[{stage.upper()}]")
+        print(f"  tag: {best['tag']}, mode: {best['mode']}, backbone: {best['backbone']}")
+        if best.get("ref_baseline") is not None:
+            print(f"  ref_baseline: {best['ref_baseline']}")
+        print(f"  lr: {best['lr']}, weight_decay: {best['weight_decay']}")
+        print(f"  num_heads: {best['num_heads']}, num_layers: {best['num_layers']}, dropout: {best['dropout']}, window_size: {best['window_size']}")
+        print(f"  mean_metric: {best['mean_metric']:.6f} ± {best['std_metric']:.6f} (seeds: {int(best['num_seeds'])})")
+        print(f"  best_seed: {int(best['best_seed'])}, best_seed_metric: {best['best_seed_metric']:.6f}")
     print(f"{'='*80}")
-    
     return df
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Analyze hyperparameter tuning results')
-    parser.add_argument('--dataset', type=str, required=True, help='Dataset name (e.g., rel-f1)')
-    parser.add_argument('--task', type=str, required=True, help='Task name (e.g., driver-top3)')
-    
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Analyze hyperparameter tuning results")
+    parser.add_argument("--dataset", type=str, required=True, help="Dataset name (e.g., rel-f1)")
+    parser.add_argument("--task", type=str, required=True, help="Task name (e.g., driver-top3)")
+    parser.add_argument("--results_path", type=str, default="results", help="Results directory (default: results)")
     args = parser.parse_args()
-    
-    # Construct JSON path
-    json_path = f"results/{args.dataset}_{args.task}.json"
-    
-    if not Path(json_path).exists():
-        print(f"Error: {json_path} not found!")
-        print(f"Make sure you have run experiments for {args.dataset}/{args.task}")
-        exit(1)
-    
-    df = analyze_results(json_path)
+
+    analyze_results(args.results_path, args.dataset, args.task)
