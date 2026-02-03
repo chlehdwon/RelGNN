@@ -37,7 +37,7 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--epochs", type=int, default=20)
 parser.add_argument("--max_steps_per_epoch", type=int, default=2000)
 parser.add_argument("--lr", type=float, default=5e-4)
-parser.add_argument("--weight_decay", type=float, default=1e-6)
+parser.add_argument("--weight_decay", type=float, default=5e-5)
 parser.add_argument("--num_heads", type=int, default=4)
 parser.add_argument("--num_layers", type=int, default=4)
 parser.add_argument("--ff_dim", type=int, default=512)
@@ -133,6 +133,19 @@ pretrained_ckpt = os.path.join(args.results_path, "transformers", f"{args.datase
 if not os.path.exists(pretrained_ckpt):
     raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_ckpt}")
 model.load_state_dict(torch.load(pretrained_ckpt, map_location=device))
+
+# Freeze transformer and other components, only train ref_alignment MLP and classifier
+for name, param in model.named_parameters():
+    if 'ref_alignment' in name or 'classifier' in name:
+        param.requires_grad = True
+    else:
+        param.requires_grad = False
+
+# Print trainable parameters
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+total_params = sum(p.numel() for p in model.parameters())
+print(f"\nTrainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+print("Only ref_alignment MLP and classifier are trainable, transformer is frozen.")
 
 retrieval_root = os.path.join(args.index_path, args.backbone, args.dataset, args.task)
 cls_embeddings = torch.load(os.path.join(retrieval_root, "cls_embeddings.pt"), map_location=device)
@@ -253,7 +266,9 @@ elif task.task_type == TaskType.REGRESSION:
 else:
     loss_fn = BCEWithLogitsLoss()
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+# Only optimize ref_alignment parameters
+trainable_params = [p for p in model.parameters() if p.requires_grad]
+optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
 
 def train_epoch(loader):

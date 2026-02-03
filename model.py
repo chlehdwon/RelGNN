@@ -1,9 +1,116 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import List, Dict
 from torch import Tensor
 from torch_geometric.typing import NodeType
 from torch_geometric.nn import PositionalEncoding
+
+
+# ---------------------------------------------------------------------------
+# Retriever objectives (RAG4DyG-style): contrastive loss with time decay + InfoNCE
+# ---------------------------------------------------------------------------
+
+def cltime_retriever_loss(
+    anchors: Tensor,
+    positives: Tensor,
+    hard_negatives: Tensor,
+    anchors_time: Tensor,
+    positives_time: Tensor,
+    negatives_time: Tensor,
+    temperature: float = 0.07,
+    decay_rate: float = 0.1,
+) -> Tensor:
+    """
+    Contrastive loss with time decay for retriever training.
+    Anchor should be close to positive (decayed by time diff) and far from negatives.
+
+    Args:
+        anchors: (B, C) query embeddings
+        positives: (B, C) positive (same entity, earlier time) embeddings
+        hard_negatives: (B, C) hard negative embeddings
+        anchors_time, positives_time, negatives_time: (B,) timestamps (e.g. unix seconds)
+        temperature: softmax temperature
+        decay_rate: lambda_decay for exp(-decay_rate * |time_diff|)
+
+    Returns:
+        Scalar loss (cross-entropy over in-batch + hard negatives with time decay).
+    """
+    batch_size = anchors.size(0)
+    all_embeddings = torch.cat([anchors, positives, hard_negatives], dim=0)
+    similarity_matrix = F.cosine_similarity(
+        all_embeddings.unsqueeze(1), all_embeddings.unsqueeze(0), dim=2
+    )
+
+    # Positive pairs: anchor-positive, apply time decay
+    time_diff_pos = torch.abs(anchors_time.unsqueeze(1) - positives_time.unsqueeze(0))
+    decay_factor_pos = torch.exp(-decay_rate * time_diff_pos).to(anchors.device)
+    pos_similarities = (
+        similarity_matrix[:batch_size, batch_size : 2 * batch_size] * decay_factor_pos
+    )
+
+    # In-batch negatives: anchor vs anchor (time decay, no self)
+    time_diff_neg = torch.abs(anchors_time.unsqueeze(1) - anchors_time.unsqueeze(0))
+    decay_factor_neg = torch.exp(-decay_rate * time_diff_neg).to(anchors.device)
+    decay_factor_neg.fill_diagonal_(0)
+    neg_similarities = similarity_matrix[:batch_size, :batch_size] * decay_factor_neg
+
+    # Hard negatives: anchor vs hard_negatives
+    time_diff_hn = torch.abs(anchors_time.unsqueeze(1) - negatives_time.unsqueeze(0))
+    decay_factor_hn = torch.exp(-decay_rate * time_diff_hn).to(anchors.device)
+    hard_neg_similarities = (
+        similarity_matrix[:batch_size, 2 * batch_size :] * decay_factor_hn
+    )
+
+    logits = (
+        torch.cat([pos_similarities, neg_similarities, hard_neg_similarities], dim=1)
+        / temperature
+    )
+    labels = torch.arange(batch_size, device=anchors.device)
+    return F.cross_entropy(logits, labels)
+
+
+def mask_correlated_samples_retriever(batch_size: int, device: torch.device) -> Tensor:
+    """Mask for InfoNCE: exclude self and positive pair (i, i+B) from negatives."""
+    N = 2 * batch_size
+    mask = torch.ones((N, N), dtype=torch.bool, device=device)
+    mask.fill_diagonal_(0)
+    for i in range(batch_size):
+        mask[i, batch_size + i] = 0
+        mask[batch_size + i, i] = 0
+    return mask
+
+
+def info_nce_retriever_loss(
+    z_i: Tensor,
+    z_j: Tensor,
+    temperature: float = 0.07,
+    mask: Tensor = None,
+) -> Tensor:
+    """
+    InfoNCE loss for augmented views (same context, two augmented embeddings).
+    z_i, z_j: (B, C) normalized embeddings from two views.
+
+    Args:
+        z_i, z_j: (B, C) view embeddings
+        temperature: softmax temperature
+        mask: (2*B, 2*B) bool mask for negative sampling (optional, built if None)
+
+    Returns:
+        Scalar InfoNCE loss.
+    """
+    batch_size = z_i.size(0)
+    z = torch.cat([z_i, z_j], dim=0)
+    sim = torch.mm(z, z.T) / temperature
+    # sim[i, B+i] = sim(z_i[i], z_j[i]); symmetric so sim[B+i, i] == sim[i, B+i]
+    sim_pos = torch.diag(sim, batch_size)  # (B,) positive pair similarity per sample
+    positive_samples = sim_pos.repeat(2).reshape(2 * batch_size, 1)  # same value for query i and query B+i
+    if mask is None:
+        mask = mask_correlated_samples_retriever(batch_size, z.device)
+    negative_samples = sim[mask].reshape(2 * batch_size, -1)
+    labels = torch.zeros(2 * batch_size, dtype=torch.long, device=z.device)
+    logits = torch.cat([positive_samples, negative_samples], dim=1)
+    return F.cross_entropy(logits, labels)
 
 
 class HeteroTemporalEncoder(torch.nn.Module):
@@ -146,6 +253,15 @@ class RelTS_Model(nn.Module):
             norm=nn.LayerNorm(channels),
         )
         
+        # Ref alignment MLP (for aligning retrieved ref embeddings)
+        self.ref_alignment = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LayerNorm(channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(channels, channels),
+        )
+        
         # Classification head
         self.classifier = nn.Sequential(
             nn.Linear(channels, channels),
@@ -165,6 +281,9 @@ class RelTS_Model(nn.Module):
         # transformer will use default init
         if self.entity_proj is not None and hasattr(self.entity_proj, 'reset_parameters'):
             self.entity_proj.reset_parameters()
+        for module in self.ref_alignment:
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
         for module in self.classifier:
             if hasattr(module, 'reset_parameters'):
                 module.reset_parameters()
@@ -245,6 +364,11 @@ class RelTS_Model(nn.Module):
                 seed_time = batch['target_timestamp']  # (B,)
                 ref_time_emb = self.temporal_encoder(seed_time, batch['retrieved_timestamps'])  # (B, 5, C)
                 ref_tokens = ref_tokens + ref_time_emb
+            # Apply ref alignment MLP
+            B_ref, num_refs, C_ref = ref_tokens.shape
+            ref_tokens = ref_tokens.view(B_ref * num_refs, C_ref)  # (B*5, C)
+            ref_tokens = self.ref_alignment(ref_tokens)  # (B*5, C)
+            ref_tokens = ref_tokens.view(B_ref, num_refs, C_ref)  # (B, 5, C)
             retrieved_ref_mask = batch.get('retrieved_ref_mask')
             if retrieved_ref_mask is not None:
                 ref_tokens = ref_tokens * retrieved_ref_mask.unsqueeze(-1).float()
@@ -303,12 +427,12 @@ class RelTS_Model(nn.Module):
         
         # # 6. Create causal mask: position i cannot attend to j when j > i
         # # Exception: position 0 (CLS) attends to all, so encode_cls gets full-sequence summary
-        # seq_len = x.size(1)
-        # causal_mask = torch.triu(
-        #     torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
-        #     diagonal=1
-        # )
-        # causal_mask[0, :] = False  # CLS (position 0) can attend to all positions
+        seq_len = x.size(1)
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+            diagonal=1
+        )
+        causal_mask[0, :] = False  # CLS (position 0) can attend to all positions
 
         # 7. Apply transformer
         h = self.transformer(
