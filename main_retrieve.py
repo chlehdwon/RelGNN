@@ -41,12 +41,11 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--dataset", type=str, default="rel-f1")
 parser.add_argument("--task", type=str, default="driver-top3")
 parser.add_argument("--num_workers", type=int, default=0)
-parser.add_argument("--cache_dir", type=str, default=os.path.expanduser("/data/starlab/relbench_examples"))
 parser.add_argument("--backbone", type=str, default="relgnn", choices=["rdl", "relgnn", "relgt"])
 parser.add_argument("--results_path", type=str, default="/data/relts/ckpts")
 parser.add_argument("--index_path", type=str, default="/data/relts/snapshots", help="Root path for snapshots / CLS index")
 parser.add_argument("--window_size", type=int, default=32)
-parser.add_argument("--batch_size", type=int, default=512)
+parser.add_argument("--batch_size", type=int, default=2048)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--num_heads", type=int, default=4)
 parser.add_argument("--num_layers", type=int, default=4)
@@ -54,7 +53,6 @@ parser.add_argument("--ff_dim", type=int, default=512)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--mode", type=str, default="recent", choices=["recent", "random"])
 parser.add_argument("--use_entity_embedding", action=argparse.BooleanOptionalAction)
-parser.add_argument("--retriever_ckpt", type=str, default=None, help="Path to retriever checkpoint. If set, loads this for retrieval (ignored when --train_retriever).")
 
 # Retriever training (used when --train_retriever)
 parser.add_argument("--train_retriever", action=argparse.BooleanOptionalAction, default=False, help="If set, train retriever objective (CLtime+InfoNCE) before running retrieval.")
@@ -147,24 +145,12 @@ with open(os.path.join(retrieval_root, "cls_mapping.json"), "r") as f:
     id_time_to_index = json.load(f)
 n_total = len(id_time_to_index)
 
-# Load checkpoint: if training retriever, load pretrained only; else load retriever or pretrained
-if args.train_retriever:
-    ckpt_path = os.path.join(args.results_path, "transformers", f"{args.dataset}_{args.task}_{args.backbone}.pth")
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Pretrained checkpoint not found (required for --train_retriever): {ckpt_path}")
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    print(f"Loaded pretrained checkpoint for retriever training: {ckpt_path}")
-else:
-    if args.retriever_ckpt is not None:
-        ckpt_path = args.retriever_ckpt
-    else:
-        default_retriever = os.path.join(args.results_path, "transformers", f"{args.dataset}_{args.task}_{args.backbone}_retriever.pth")
-        default_pretrained = os.path.join(args.results_path, "transformers", f"{args.dataset}_{args.task}_{args.backbone}.pth")
-        ckpt_path = default_retriever if os.path.exists(default_retriever) else default_pretrained
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    print(f"Loaded checkpoint for retrieval: {ckpt_path}")
+# Load checkpoint: always use pretrained transformer (no separate retriever checkpoint)
+ckpt_path = os.path.join(args.results_path, "transformers", f"{args.dataset}_{args.task}_{args.backbone}.pth")
+if not os.path.exists(ckpt_path):
+    raise FileNotFoundError(f"Pretrained checkpoint not found: {ckpt_path}")
+model.load_state_dict(torch.load(ckpt_path, map_location=device))
+print(f"Loaded checkpoint: {ckpt_path}")
 
 
 def mask_sequence_events(batch, mask_prob, device):
