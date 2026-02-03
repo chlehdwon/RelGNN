@@ -134,19 +134,6 @@ if not os.path.exists(pretrained_ckpt):
     raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_ckpt}")
 model.load_state_dict(torch.load(pretrained_ckpt, map_location=device))
 
-# Freeze transformer and other components, only train ref_alignment MLP and classifier
-for name, param in model.named_parameters():
-    if 'ref_alignment' in name or 'classifier' in name:
-        param.requires_grad = True
-    else:
-        param.requires_grad = False
-
-# Print trainable parameters
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total_params = sum(p.numel() for p in model.parameters())
-print(f"\nTrainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
-print("Only ref_alignment MLP and classifier are trainable, transformer is frozen.")
-
 retrieval_root = os.path.join(args.index_path, args.backbone, args.dataset, args.task)
 cls_embeddings = torch.load(os.path.join(retrieval_root, "cls_embeddings.pt"), map_location=device)
 cls_entity_ids = torch.load(os.path.join(retrieval_root, "cls_entity_ids.pt"), map_location=device)
@@ -196,35 +183,36 @@ rng = np.random.default_rng(args.seed)
 
 
 def augment_batch_with_retrieval(batch, id_time_to_index, top5_indices, cls_embeddings, cls_labels, cls_timestamps):
-    """Add retrieved_cls_emb (B, 5, C), retrieved_labels (B, 5), retrieved_timestamps (B, 5), retrieved_ref_mask (B, 5)."""
+    """Add retrieved_cls_emb (B, 5, C), retrieved_labels (B, 5), retrieved_timestamps (B, 5), retrieved_ref_mask (B, 5).
+    Vectorized: single loop for dict lookups, then batched tensor indexing (no per-sample inner loop)."""
     entity_ids = batch["entity_id"].cpu()
     timestamps = batch["target_timestamp"].cpu()
     B = entity_ids.size(0)
     C = cls_embeddings.size(1)
     device = batch["input_embeddings"].device
-    retrieved_cls_emb = torch.zeros(B, 5, C, device=device, dtype=cls_embeddings.dtype)
-    retrieved_labels = torch.zeros(B, 5, device=device, dtype=torch.long)
-    retrieved_timestamps = torch.zeros(B, 5, device=device, dtype=torch.float32)
-    retrieved_ref_mask = torch.zeros(B, 5, dtype=torch.bool, device=device)
+    # Build batch index into cls_mapping (one dict lookup per sample; unavoidable without dataset change)
+    batch_idx = []
     for b in range(B):
         eid, ts = entity_ids[b].item(), timestamps[b].item()
         key = _id_ts_key(eid, ts)
         idx = id_time_to_index.get(key)
         if idx is None and float(ts) == int(ts):
             idx = id_time_to_index.get(f"({eid}, {int(ts)})")
-        if idx is None:
-            continue
-        top5 = top5_indices[idx]
-        for j in range(5):
-            if top5[j] >= 0:
-                retrieved_cls_emb[b, j] = cls_embeddings[top5[j]]
-                retrieved_labels[b, j] = cls_labels[top5[j]]
-                retrieved_timestamps[b, j] = cls_timestamps[top5[j]]
-                retrieved_ref_mask[b, j] = True
+        batch_idx.append(idx if idx is not None else -1)
+    batch_idx = torch.tensor(batch_idx, dtype=torch.long, device=device)
+    # Batched gather: (B,) -> (B, 5) indices; use 0 for missing rows then mask
+    batch_idx_safe = batch_idx.clamp(min=0)
+    top5_for_batch = top5_indices[batch_idx_safe]
+    ref_mask = (batch_idx.unsqueeze(1) >= 0) & (top5_for_batch >= 0)
+    flat_idx = top5_for_batch.clamp(min=0)
+    retrieved_cls_emb = cls_embeddings[flat_idx]
+    retrieved_labels = cls_labels[flat_idx]
+    retrieved_timestamps = cls_timestamps[flat_idx]
+    retrieved_cls_emb = retrieved_cls_emb * ref_mask.unsqueeze(-1).to(retrieved_cls_emb.dtype)
     batch["retrieved_cls_emb"] = retrieved_cls_emb
     batch["retrieved_labels"] = retrieved_labels
     batch["retrieved_timestamps"] = retrieved_timestamps
-    batch["retrieved_ref_mask"] = retrieved_ref_mask
+    batch["retrieved_ref_mask"] = ref_mask
     return batch
 
 
@@ -266,9 +254,7 @@ elif task.task_type == TaskType.REGRESSION:
 else:
     loss_fn = BCEWithLogitsLoss()
 
-# Only optimize ref_alignment parameters
-trainable_params = [p for p in model.parameters() if p.requires_grad]
-optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
 
 def train_epoch(loader):

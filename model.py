@@ -75,9 +75,9 @@ def mask_correlated_samples_retriever(batch_size: int, device: torch.device) -> 
     N = 2 * batch_size
     mask = torch.ones((N, N), dtype=torch.bool, device=device)
     mask.fill_diagonal_(0)
-    for i in range(batch_size):
-        mask[i, batch_size + i] = 0
-        mask[batch_size + i, i] = 0
+    i = torch.arange(batch_size, device=device)
+    mask[i, batch_size + i] = False
+    mask[batch_size + i, i] = False
     return mask
 
 
@@ -253,15 +253,6 @@ class RelTS_Model(nn.Module):
             norm=nn.LayerNorm(channels),
         )
         
-        # Ref alignment MLP (for aligning retrieved ref embeddings)
-        self.ref_alignment = nn.Sequential(
-            nn.Linear(channels, channels),
-            nn.LayerNorm(channels),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(channels, channels),
-        )
-        
         # Classification head
         self.classifier = nn.Sequential(
             nn.Linear(channels, channels),
@@ -281,9 +272,6 @@ class RelTS_Model(nn.Module):
         # transformer will use default init
         if self.entity_proj is not None and hasattr(self.entity_proj, 'reset_parameters'):
             self.entity_proj.reset_parameters()
-        for module in self.ref_alignment:
-            if hasattr(module, 'reset_parameters'):
-                module.reset_parameters()
         for module in self.classifier:
             if hasattr(module, 'reset_parameters'):
                 module.reset_parameters()
@@ -338,11 +326,10 @@ class RelTS_Model(nn.Module):
         is_mask = torch.zeros(batch_size, seq_timestamps.size(1), dtype=torch.bool, device=device)
         is_mask[:, -1] = True  # Last position is target (mask label)
         
-        # 3. Encode time and labels
-        # Use target timestamp as seed_time (reference point)
+        # 3. Encode time and labels (fused in retrieval path to avoid duplicate encoder calls)
         seed_time = batch['target_timestamp']  # (batch,)
-        time_emb = self.temporal_encoder(seed_time, seq_timestamps)  # (batch, seq_len, embed_dim)
-        label_emb = self.label_embedder(seq_labels, is_mask=is_mask)  # (batch, seq_len, embed_dim)
+        use_retrieval = 'retrieved_cls_emb' in batch and 'retrieved_labels' in batch
+        num_refs = 5
 
         # 3b. Add entity embeddings if provided
         if self.entity_proj is not None and 'input_entity_embeddings' in batch and 'target_entity_embedding' in batch:
@@ -352,48 +339,41 @@ class RelTS_Model(nn.Module):
             ], dim=1)
             seq_embeddings = seq_embeddings + self.entity_proj(seq_entity_embeddings)
 
-        use_retrieval = 'retrieved_cls_emb' in batch and 'retrieved_labels' in batch
-        num_refs = 5
-
         if use_retrieval:
-            # ref_tokens = retrieved_cls_emb + label_emb(retrieved_labels) + time_emb(retrieved_timestamps); (B, 5, C)
-            ref_labels = batch['retrieved_labels'].long().clamp(0, 1)  # binary for LabelEmbedder
-            ref_label_emb = self.label_embedder(ref_labels, is_mask=None)  # (B, 5, C)
-            ref_tokens = batch['retrieved_cls_emb'] + ref_label_emb
-            if 'retrieved_timestamps' in batch:
-                seed_time = batch['target_timestamp']  # (B,)
-                ref_time_emb = self.temporal_encoder(seed_time, batch['retrieved_timestamps'])  # (B, 5, C)
-                ref_tokens = ref_tokens + ref_time_emb
-            # Apply ref alignment MLP
-            B_ref, num_refs, C_ref = ref_tokens.shape
-            ref_tokens = ref_tokens.view(B_ref * num_refs, C_ref)  # (B*5, C)
-            ref_tokens = self.ref_alignment(ref_tokens)  # (B*5, C)
-            ref_tokens = ref_tokens.view(B_ref, num_refs, C_ref)  # (B, 5, C)
+            # Fused temporal + label encoding: one call for [ref_timestamps; seq_timestamps] and [ref_labels; seq_labels]
+            all_timestamps = torch.cat([
+                batch['retrieved_timestamps'],
+                seq_timestamps,
+            ], dim=1)  # (B, 5 + window_size+1)
+            all_time_emb = self.temporal_encoder(seed_time, all_timestamps)
+            ref_time_emb = all_time_emb[:, :num_refs]
+            time_emb = all_time_emb[:, num_refs:]
+            ref_labels = batch['retrieved_labels'].long().clamp(0, 1)
+            all_labels = torch.cat([ref_labels, seq_labels], dim=1)
+            all_is_mask = torch.cat([
+                torch.zeros(batch_size, num_refs, dtype=torch.bool, device=device),
+                is_mask,
+            ], dim=1)
+            all_label_emb = self.label_embedder(all_labels, is_mask=all_is_mask)
+            ref_label_emb = all_label_emb[:, :num_refs]
+            label_emb = all_label_emb[:, num_refs:]
+            ref_tokens = batch['retrieved_cls_emb'] + ref_label_emb + ref_time_emb
             retrieved_ref_mask = batch.get('retrieved_ref_mask')
             if retrieved_ref_mask is not None:
                 ref_tokens = ref_tokens * retrieved_ref_mask.unsqueeze(-1).float()
             cls_emb = self.cls_emb.expand(batch_size, -1, -1)
             sep_emb = self.sep_emb.expand(batch_size, -1, -1)
             # [CLS] [ref_1] ... [ref_5] [SEP] [ctx1] ... [ctx_k] [target]
-            # seq_embeddings here is (B, window_size+1) = [ctx, target] (no CLS yet)
             seq_embeddings = torch.cat([
                 cls_emb,
                 ref_tokens,
                 sep_emb,
-                seq_embeddings,  # full ctx + target
-            ], dim=1)  # (batch, 1 + 5 + 1 + window_size + 1, C)
-            time_emb = torch.cat([
-                torch.zeros(batch_size, 1, self.channels, device=device),
-                torch.zeros(batch_size, num_refs, self.channels, device=device),
-                torch.zeros(batch_size, 1, self.channels, device=device),
-                time_emb,  # (B, window_size+1)
+                seq_embeddings,
             ], dim=1)
-            label_emb = torch.cat([
-                torch.zeros(batch_size, 1, self.channels, device=device),
-                torch.zeros(batch_size, num_refs, self.channels, device=device),
-                torch.zeros(batch_size, 1, self.channels, device=device),
-                label_emb,  # (B, window_size+1)
-            ], dim=1)
+            # Single zero block for CLS+refs+SEP (1+5+1 positions) instead of three separate allocations
+            zero_block = torch.zeros(batch_size, 1 + num_refs + 1, self.channels, device=device, dtype=time_emb.dtype)
+            time_emb = torch.cat([zero_block, time_emb], dim=1)
+            label_emb = torch.cat([zero_block, label_emb], dim=1)
             ref_valid = retrieved_ref_mask if retrieved_ref_mask is not None else torch.ones(batch_size, num_refs, dtype=torch.bool, device=device)
             seq_mask = torch.cat([
                 torch.ones(batch_size, 1, dtype=torch.bool, device=device),
@@ -403,7 +383,9 @@ class RelTS_Model(nn.Module):
                 torch.ones(batch_size, 1, dtype=torch.bool, device=device),
             ], dim=1)
         else:
-            # 4. Prepend [CLS] embedding (no retrieval)
+            # No retrieval: encode context only, then prepend [CLS]
+            time_emb = self.temporal_encoder(seed_time, seq_timestamps)
+            label_emb = self.label_embedder(seq_labels, is_mask=is_mask)
             cls_emb = self.cls_emb.expand(batch_size, -1, -1)
             seq_embeddings = torch.cat([cls_emb, seq_embeddings], dim=1)
             time_emb = torch.cat([torch.zeros_like(cls_emb), time_emb], dim=1)
