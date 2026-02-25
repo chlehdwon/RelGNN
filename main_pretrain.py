@@ -1,10 +1,19 @@
+import os
+# OMP_NUM_THREADS: openmp, OPENBLAS_NUM_THREADS: openblas, MKL_NUM_THREADS: mkl, VECLIB_MAXIMUM_THREADS: accelerate, NUMEXPR_NUM_THREADS: numexpr
+os.environ["OMP_NUM_THREADS"] = "4" # export OMP_NUM_THREADS=4
+os.environ["MKL_NUM_THREADS"] = "4" # export MKL_NUM_THREADS=6
+os.environ["NUMEXPR_NUM_THREADS"] = "4" # export NUMEXPR_NUM_THREADS=6
+# os.environ["OPENBLAS_NUM_THREADS"] = "2" # export OPENBLAS_NUM_THREADS=4
+# os.environ["VECLIB_MAXIMUM_THREADS"] = "2" # export VECLIB_MAXIMUM_THREADS=4
+
 import argparse
 import json
 import os
 from pathlib import Path
+from datetime import datetime
+import gc
 
 import numpy as np
-from datetime import datetime
 import torch
 from torch.nn import BCEWithLogitsLoss, L1Loss
 from torch_frame import stype
@@ -531,19 +540,31 @@ if args.save:
     timestamps = timestamps[order]
     cls_embeddings = cls_embeddings[order]
 
-    # Build (entity_id, timestamp) -> index for reverse lookup (same key format as indexing.py; float(ts) for consistent lookup in main_predict)
-    id_time_to_index = {}
-    for i in range(len(entity_ids)):
-        eid = entity_ids[i].item()
-        ts = timestamps[i].item()
-        key = f"({eid}, {float(ts)})"
-        id_time_to_index[key] = int(i)
-
     retrieval_root = os.path.join(args.index_path, args.backbone, args.dataset, args.task)
     os.makedirs(retrieval_root, exist_ok=True)
-    torch.save(cls_embeddings, os.path.join(retrieval_root, "cls_embeddings.pt"))
-    torch.save(entity_ids, os.path.join(retrieval_root, "cls_entity_ids.pt"))
-    torch.save(timestamps, os.path.join(retrieval_root, "cls_timestamps.pt"))
-    with open(os.path.join(retrieval_root, "cls_mapping.json"), "w") as f:
-        json.dump(id_time_to_index, f)
+    np.save(
+        os.path.join(retrieval_root, "cls_embeddings.npy"),
+        cls_embeddings.numpy().astype(np.float32, copy=False),
+    )
+    cls_meta = {
+        "entity_ids": entity_ids.long(),
+        "timestamps": timestamps.long(),
+    }
+    torch.save(cls_meta, os.path.join(retrieval_root, "cls_meta.pt"))
+    key = (cls_meta["entity_ids"].numpy().astype(np.uint64) << np.uint64(32)) | (
+        cls_meta["timestamps"].numpy().astype(np.uint64) & np.uint64(0xFFFFFFFF)
+    )
+    order_key = np.argsort(key, kind="mergesort")
+    key_sorted = key[order_key]
+    row_ids_sorted = np.arange(len(key), dtype=np.int64)[order_key]
+    np.savez_compressed(
+        os.path.join(retrieval_root, "cls_lookup.npz"),
+        key_sorted=key_sorted,
+        row_ids_sorted=row_ids_sorted,
+    )
     print(f"Saved CLS retrieval data to: {retrieval_root}")
+
+# Explicitly release memory at the end of the run to avoid buildup across repeated experiments.
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()

@@ -14,6 +14,7 @@ import torch
 from torch.nn import BCEWithLogitsLoss, L1Loss
 from torch_geometric.seed import seed_everything
 from tqdm import tqdm
+import gc
 
 from relbench.base import EntityTask, TaskType
 from relbench.datasets import get_dataset
@@ -34,7 +35,7 @@ parser.add_argument("--index_path", type=str, default="/data/relts/snapshots")
 parser.add_argument("--window_size", type=int, default=32)
 parser.add_argument("--batch_size", type=int, default=512)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--epochs", type=int, default=20)
+parser.add_argument("--epochs", type=int, default=30)
 parser.add_argument("--max_steps_per_epoch", type=int, default=2000)
 parser.add_argument("--lr", type=float, default=5e-4)
 parser.add_argument("--weight_decay", type=float, default=5e-5)
@@ -135,14 +136,13 @@ if not os.path.exists(pretrained_ckpt):
 model.load_state_dict(torch.load(pretrained_ckpt, map_location=device))
 
 retrieval_root = os.path.join(args.index_path, args.backbone, args.dataset, args.task)
-cls_embeddings = torch.load(os.path.join(retrieval_root, "cls_embeddings.pt"), map_location=device)
-cls_entity_ids = torch.load(os.path.join(retrieval_root, "cls_entity_ids.pt"), map_location=device)
-cls_timestamps = torch.load(os.path.join(retrieval_root, "cls_timestamps.pt"), map_location=device)
-top5_indices = torch.load(os.path.join(retrieval_root, "top5_indices.pt"), map_location=device)  # (N, 5)
-
-with open(os.path.join(retrieval_root, "cls_mapping.json"), "r") as f:
-    id_time_to_index = json.load(f)
-n_total = len(id_time_to_index)
+cls_meta = torch.load(os.path.join(retrieval_root, "cls_meta.pt"), map_location="cpu")
+cls_entity_ids = cls_meta["entity_ids"].long()
+cls_timestamps = cls_meta["timestamps"].long()
+cls_lookup = np.load(os.path.join(retrieval_root, "cls_lookup.npz"))
+cls_key_sorted = cls_lookup["key_sorted"].astype(np.uint64, copy=False)
+cls_row_ids_sorted = cls_lookup["row_ids_sorted"].astype(np.int64, copy=False)
+n_total = int(cls_entity_ids.size(0))
 
 # Build (entity_id, timestamp) -> label from builder.entity_sequences (same source as indexing/dataset)
 id_time_to_label = {}
@@ -150,85 +150,76 @@ train_labels_list = []
 for split in ("train", "val", "test"):
     for entity_id, seq in builder.entity_sequences[split].items():
         for ts, _emb, label, _ent_emb in seq:
-            key = f"({entity_id}, {float(ts)})"
+            key = (int(entity_id), int(ts))
             id_time_to_label[key] = float(label)
             if split == "train":
                 train_labels_list.append(float(label))
-
-# cls_labels[i] = label for (cls_entity_ids[i], cls_timestamps[i]); key format matches id_time_to_label
-def _id_ts_key(eid, ts):
-    return f"({eid}, {float(ts)})"
 
 if task.task_type == TaskType.REGRESSION:
     train_median = np.median(train_labels_list)
     cls_labels = torch.zeros(n_total, dtype=torch.long)
     for i in range(n_total):
-        key = _id_ts_key(cls_entity_ids[i].item(), cls_timestamps[i].item())
+        key = (int(cls_entity_ids[i].item()), int(cls_timestamps[i].item()))
         cls_labels[i] = 1 if id_time_to_label.get(key, 0.0) > train_median else 0
 else:
     cls_labels = torch.zeros(n_total, dtype=torch.long)
     for i in range(n_total):
-        key = _id_ts_key(cls_entity_ids[i].item(), cls_timestamps[i].item())
+        key = (int(cls_entity_ids[i].item()), int(cls_timestamps[i].item()))
         lbl = id_time_to_label.get(key, 0.0)
         cls_labels[i] = int(round(lbl)) if task.task_type == TaskType.BINARY_CLASSIFICATION else (1 if lbl != 0 else 0)
     cls_labels = cls_labels.clamp(0, 1)
 
-cls_embeddings = cls_embeddings.to(device)
-cls_timestamps = cls_timestamps.to(device)
-cls_labels = cls_labels.to(device)
-top5_indices = top5_indices.to(device)
+cls_emb_npy_path = os.path.join(retrieval_root, "cls_embeddings.npy")
+top5_npy_path = os.path.join(retrieval_root, "top5_indices.npy")
+if not os.path.exists(cls_emb_npy_path):
+    raise FileNotFoundError(f"Missing retrieval embedding file: {cls_emb_npy_path}")
+if not os.path.exists(top5_npy_path):
+    raise FileNotFoundError(f"Missing retrieval top-k file: {top5_npy_path}")
+cls_embeddings_mm = np.load(cls_emb_npy_path, mmap_mode="r")
+top5_indices_mm = np.load(top5_npy_path, mmap_mode="r")
+cls_labels_np = cls_labels.numpy().astype(np.int64, copy=False)
+cls_timestamps_np = cls_timestamps.numpy().astype(np.int64, copy=False)
 
 # RNG for random ref baseline (reproducible across runs with same seed)
 rng = np.random.default_rng(args.seed)
 
 
-def augment_batch_with_retrieval(batch, id_time_to_index, top5_indices, cls_embeddings, cls_labels, cls_timestamps):
-    """Add retrieved_cls_emb (B, 5, C), retrieved_labels (B, 5), retrieved_timestamps (B, 5), retrieved_ref_mask (B, 5).
-    Vectorized: single loop for dict lookups, then batched tensor indexing (no per-sample inner loop)."""
+def lookup_row_indices(entity_ids_tensor, timestamps_tensor, key_sorted, row_ids_sorted):
+    """Vectorized lookup for (entity_id, timestamp) -> row index; returns int64 array with -1 for missing."""
+    eids = entity_ids_tensor.detach().cpu().numpy().astype(np.uint64)
+    ts = timestamps_tensor.detach().cpu().long().numpy().astype(np.uint64)
+    query = (eids << np.uint64(32)) | (ts & np.uint64(0xFFFFFFFF))
+    pos = np.searchsorted(key_sorted, query)
+    idx = np.full(query.shape[0], -1, dtype=np.int64)
+    in_bounds = pos < key_sorted.shape[0]
+    found = np.zeros(query.shape[0], dtype=bool)
+    found[in_bounds] = key_sorted[pos[in_bounds]] == query[in_bounds]
+    idx[found] = row_ids_sorted[pos[found]]
+    return idx
+
+
+def augment_batch_with_retrieval(batch):
+    """Low-memory retrieval path using memmap arrays and per-batch GPU transfer."""
     entity_ids = batch["entity_id"].cpu()
     timestamps = batch["target_timestamp"].cpu()
-    B = entity_ids.size(0)
-    C = cls_embeddings.size(1)
     device = batch["input_embeddings"].device
-    # Build batch index into cls_mapping (one dict lookup per sample; unavoidable without dataset change)
-    batch_idx = []
-    for b in range(B):
-        eid, ts = entity_ids[b].item(), timestamps[b].item()
-        key = _id_ts_key(eid, ts)
-        idx = id_time_to_index.get(key)
-        if idx is None and float(ts) == int(ts):
-            idx = id_time_to_index.get(f"({eid}, {int(ts)})")
-        batch_idx.append(idx if idx is not None else -1)
-    batch_idx = torch.tensor(batch_idx, dtype=torch.long, device=device)
-    # Batched gather: (B,) -> (B, 5) indices; use 0 for missing rows then mask
-    batch_idx_safe = batch_idx.clamp(min=0)
-    top5_for_batch = top5_indices[batch_idx_safe]
-    ref_mask = (batch_idx.unsqueeze(1) >= 0) & (top5_for_batch >= 0)
-    flat_idx = top5_for_batch.clamp(min=0)
-    retrieved_cls_emb = cls_embeddings[flat_idx]
-    retrieved_labels = cls_labels[flat_idx]
-    retrieved_timestamps = cls_timestamps[flat_idx]
-    retrieved_cls_emb = retrieved_cls_emb * ref_mask.unsqueeze(-1).to(retrieved_cls_emb.dtype)
-    batch["retrieved_cls_emb"] = retrieved_cls_emb
-    batch["retrieved_labels"] = retrieved_labels
-    batch["retrieved_timestamps"] = retrieved_timestamps
-    batch["retrieved_ref_mask"] = ref_mask
-    return batch
+    batch_idx = lookup_row_indices(entity_ids, timestamps, cls_key_sorted, cls_row_ids_sorted)  # np.int64 [B]
 
+    batch_idx_safe = np.maximum(batch_idx, 0)
+    top5_for_batch = top5_indices_mm[batch_idx_safe]  # np.int64 [B, 5]
+    ref_mask_np = (batch_idx[:, None] >= 0) & (top5_for_batch >= 0)
+    flat_idx = np.maximum(top5_for_batch, 0)
 
-def augment_batch_with_random_refs(batch, n_total, cls_embeddings, cls_labels, cls_timestamps, rng):
-    """Random augmentation baseline: sample 5 random indices from [0, n_total) per sample.
-    Adds same keys as augment_batch_with_retrieval."""
-    B = batch["entity_id"].size(0)
-    C = cls_embeddings.size(1)
-    device = batch["input_embeddings"].device
-    # (B, 5) random indices in [0, n_total)
-    rand_indices = rng.integers(0, n_total, size=(B, 5))
-    rand_indices = torch.from_numpy(rand_indices).to(device)
-    retrieved_cls_emb = cls_embeddings[rand_indices]
-    retrieved_labels = cls_labels[rand_indices]
-    retrieved_timestamps = cls_timestamps[rand_indices]
-    retrieved_ref_mask = torch.ones(B, 5, dtype=torch.bool, device=device)
+    retrieved_cls_emb_np = cls_embeddings_mm[flat_idx]  # [B, 5, C], float16 memmap
+    retrieved_labels_np = cls_labels_np[flat_idx]       # [B, 5]
+    retrieved_timestamps_np = cls_timestamps_np[flat_idx]  # [B, 5]
+
+    retrieved_cls_emb = torch.from_numpy(np.asarray(retrieved_cls_emb_np)).to(device=device, dtype=torch.float32)
+    retrieved_labels = torch.from_numpy(np.asarray(retrieved_labels_np)).to(device=device, dtype=torch.long)
+    retrieved_timestamps = torch.from_numpy(np.asarray(retrieved_timestamps_np)).to(device=device, dtype=torch.float32)
+    retrieved_ref_mask = torch.from_numpy(ref_mask_np).to(device=device, dtype=torch.bool)
+    retrieved_cls_emb = retrieved_cls_emb * retrieved_ref_mask.unsqueeze(-1).to(retrieved_cls_emb.dtype)
+
     batch["retrieved_cls_emb"] = retrieved_cls_emb
     batch["retrieved_labels"] = retrieved_labels
     batch["retrieved_timestamps"] = retrieved_timestamps
@@ -236,15 +227,27 @@ def augment_batch_with_random_refs(batch, n_total, cls_embeddings, cls_labels, c
     return batch
 
 
+def augment_batch_with_random_refs(batch):
+    """Low-memory random baseline using memmap arrays and per-batch GPU transfer."""
+    B = batch["entity_id"].size(0)
+    device = batch["input_embeddings"].device
+    rand_indices = rng.integers(0, n_total, size=(B, 5), dtype=np.int64)
+    retrieved_cls_emb_np = cls_embeddings_mm[rand_indices]
+    retrieved_labels_np = cls_labels_np[rand_indices]
+    retrieved_timestamps_np = cls_timestamps_np[rand_indices]
+
+    batch["retrieved_cls_emb"] = torch.from_numpy(np.asarray(retrieved_cls_emb_np)).to(device=device, dtype=torch.float32)
+    batch["retrieved_labels"] = torch.from_numpy(np.asarray(retrieved_labels_np)).to(device=device, dtype=torch.long)
+    batch["retrieved_timestamps"] = torch.from_numpy(np.asarray(retrieved_timestamps_np)).to(device=device, dtype=torch.float32)
+    batch["retrieved_ref_mask"] = torch.ones(B, 5, dtype=torch.bool, device=device)
+    return batch
+
+
 def augment_batch(batch):
     """Dispatch to retrieval or random ref augmentation based on args.ref_baseline."""
     if args.ref_baseline == "random":
-        return augment_batch_with_random_refs(
-            batch, n_total, cls_embeddings, cls_labels, cls_timestamps, rng
-        )
-    return augment_batch_with_retrieval(
-        batch, id_time_to_index, top5_indices, cls_embeddings, cls_labels, cls_timestamps
-    )
+        return augment_batch_with_random_refs(batch)
+    return augment_batch_with_retrieval(batch)
 
 
 if task.task_type == TaskType.BINARY_CLASSIFICATION:
@@ -412,3 +415,8 @@ if args.report:
     with open(results_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"Results saved to {results_path}")
+
+# Explicitly release memory at the end of the run to avoid buildup across repeated experiments.
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()

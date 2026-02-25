@@ -217,9 +217,9 @@ def create_snapshot_index(loader: NeighborLoader, split_name: str, base_dir: Pat
         split_name: Name of the split ('train', 'val', or 'test')
         base_dir: Base directory to save {split_name}.pt file
     """
-    mapping = {}  # {(entity_id, timestamp): index}
-    all_embeddings = []  # Collect all embeddings
-    global_index = 0
+    all_embeddings = []   # [num_samples, channels]
+    all_entity_ids = []   # [num_samples]
+    all_timestamps = []   # [num_samples]
     
     print(f"\nCreating snapshot index for {split_name}...")
     model.eval()
@@ -238,35 +238,22 @@ def create_snapshot_index(loader: NeighborLoader, split_name: str, base_dir: Pat
             task.entity_table,
         )  # Shape: [batch_size, channels]
         
-        # For each sample in the batch
-        for i in range(entity_ids):
-            entity_id = entity_node_indices[i].item()
-            timestamp = seed_times[i].item()
-            
-            # Create mapping key
-            key = f"({entity_id}, {timestamp})"
-            
-            # Skip if already processed (shouldn't happen with deterministic loader)
-            if key in mapping:
-                print(f"Warning: Duplicate key {key} found!")
-                continue
-            
-            # Save the mapping
-            mapping[key] = global_index
-            
-            # Collect embedding
-            all_embeddings.append(entity_embeddings[i].cpu())
-            
-            global_index += 1
+        all_embeddings.append(entity_embeddings[:entity_ids].cpu())
+        all_entity_ids.append(entity_node_indices[:entity_ids].cpu().long())
+        all_timestamps.append(seed_times[:entity_ids].cpu().long())
     
-    # Concatenate all embeddings and save as {split_name}.pt
-    all_embeddings_tensor = torch.stack(all_embeddings, dim=0)  # [num_samples, channels]
-    embeddings_path = base_dir / f"{split_name}.pt"
-    torch.save(all_embeddings_tensor, embeddings_path)
+    if len(all_embeddings) == 0:
+        all_embeddings_tensor = torch.empty((0, 0))
+        entity_ids_tensor = torch.empty((0,), dtype=torch.long)
+        timestamps_tensor = torch.empty((0,), dtype=torch.long)
+    else:
+        all_embeddings_tensor = torch.cat(all_embeddings, dim=0)  # [num_samples, channels]
+        entity_ids_tensor = torch.cat(all_entity_ids, dim=0)
+        timestamps_tensor = torch.cat(all_timestamps, dim=0)
     
-    print(f"Created {global_index} embeddings for {split_name}, saved to {embeddings_path}")
+    print(f"Created {all_embeddings_tensor.size(0)} embeddings for {split_name}")
     print(f"Tensor shape: {all_embeddings_tensor.shape}")
-    return mapping
+    return all_embeddings_tensor, entity_ids_tensor, timestamps_tensor
 
 
 @torch.no_grad()
@@ -355,12 +342,48 @@ def save_all_snapshots(loader_dict: Dict[str, NeighborLoader], base_dir: Path):
     """
     base_dir.mkdir(parents=True, exist_ok=True)
     
-    all_mappings = {}
-
     if not args.entity_only:
-        for split_name, loader in loader_dict.items():
-            mapping = create_snapshot_index(loader, split_name, base_dir)
-            all_mappings[split_name] = mapping
+        split_order = ["train", "val", "test"]
+        split_embeddings = {}
+        split_entity_ids = {}
+        split_timestamps = {}
+        for split_name in split_order:
+            loader = loader_dict[split_name]
+            emb, eids, ts = create_snapshot_index(loader, split_name, base_dir)
+            split_embeddings[split_name] = emb
+            split_entity_ids[split_name] = eids
+            split_timestamps[split_name] = ts
+
+        # Save unified snapshot embeddings as .npy (retrieval intermediate; no .pt fallback).
+        all_embeddings_tensor = torch.cat([split_embeddings[s] for s in split_order], dim=0)
+        np.save(base_dir / "snapshot_embeddings.npy", all_embeddings_tensor.numpy().astype(np.float32, copy=False))
+
+        # Save split offsets and row metadata.
+        split_sizes = [split_embeddings[s].size(0) for s in split_order]
+        split_offsets = np.array([0], dtype=np.int64)
+        split_offsets = np.concatenate([split_offsets, np.cumsum(np.array(split_sizes, dtype=np.int64))])
+        all_entity_ids = torch.cat([split_entity_ids[s] for s in split_order], dim=0).numpy().astype(np.int64)
+        all_timestamps = torch.cat([split_timestamps[s] for s in split_order], dim=0).numpy().astype(np.int64)
+        np.savez_compressed(
+            base_dir / "snapshot_meta.npz",
+            entity_ids=all_entity_ids,
+            timestamps=all_timestamps,
+            split_offsets=split_offsets,
+        )
+
+        # Save split-specific lookup arrays (packed key -> local row index).
+        for split_idx, split_name in enumerate(split_order):
+            eids = split_entity_ids[split_name].numpy().astype(np.uint64)
+            ts = split_timestamps[split_name].numpy().astype(np.uint64)
+            keys = (eids << np.uint64(32)) | (ts & np.uint64(0xFFFFFFFF))
+            order = np.argsort(keys, kind="mergesort")
+            key_sorted = keys[order]
+            row_ids_sorted = np.arange(len(keys), dtype=np.int64)[order]
+            np.savez_compressed(
+                base_dir / f"lookup_{split_name}.npz",
+                key_sorted=key_sorted,
+                row_ids_sorted=row_ids_sorted,
+            )
     
     # Save per-entity embeddings once (use train loader by default)
     num_entities = data[task.entity_table].num_nodes
@@ -377,12 +400,8 @@ def save_all_snapshots(loader_dict: Dict[str, NeighborLoader], base_dir: Path):
     print(f"\nEntity mapping saved to {entity_mapping_path}")
 
     if not args.entity_only:
-        mapping_path = base_dir / "mapping.json"
-        with open(mapping_path, "w") as f:
-            json.dump(all_mappings, f, indent=2)
-        
-        print(f"Mapping saved to {mapping_path}")
-        print(f"Total snapshots: {sum(len(m) for m in all_mappings.values())}")
+        print(f"Unified snapshot files saved to {base_dir}")
+        print(f"Total snapshots: {int(split_offsets[-1])}")
 
 
 if args.backbone == "relgnn":
@@ -414,4 +433,4 @@ print(f"\nSaving snapshots to {snapshot_base_dir}")
 save_all_snapshots(loader_dict, snapshot_base_dir)
 
 print("\nSnapshot indexing complete!")
-print(f"Structure: {snapshot_base_dir}/{{train.pt,val.pt,test.pt,mapping.json}}")
+print(f"Structure: {snapshot_base_dir}/{{snapshot_embeddings.npy,snapshot_meta.npz,lookup_train.npz,lookup_val.npz,lookup_test.npz}}")

@@ -10,11 +10,12 @@ Usage:
   python main_retrieve.py --dataset rel-f1 --task driver-top3 --train_retriever --epochs 5 --alpha_aug 0.1
 """
 import argparse
-import json
 import os
 import random
 from collections import defaultdict
+import gc
 
+import numpy as np
 import torch
 from torch_geometric.seed import seed_everything
 from tqdm import tqdm
@@ -136,14 +137,19 @@ model = RelTS_Model(
 ).to(device)
 
 retrieval_root = os.path.join(args.index_path, args.backbone, args.dataset, args.task)
-cls_embeddings = torch.load(os.path.join(retrieval_root, "cls_embeddings.pt"), map_location=device)
-cls_entity_ids = torch.load(os.path.join(retrieval_root, "cls_entity_ids.pt"), map_location=device)
-cls_timestamps = torch.load(os.path.join(retrieval_root, "cls_timestamps.pt"), map_location=device)
+cls_emb_npy_path = os.path.join(retrieval_root, "cls_embeddings.npy")
+if not os.path.exists(cls_emb_npy_path):
+    raise FileNotFoundError(f"Missing retrieval embedding file: {cls_emb_npy_path}")
+cls_embeddings_mm = np.load(cls_emb_npy_path, mmap_mode="r")
+cls_embeddings = torch.from_numpy(np.asarray(cls_embeddings_mm)).to(device=device, dtype=torch.float32)
+cls_meta = torch.load(os.path.join(retrieval_root, "cls_meta.pt"), map_location="cpu")
+cls_entity_ids = cls_meta["entity_ids"].long().to(device)
+cls_timestamps = cls_meta["timestamps"].long().to(device)
 cls_embeddings = cls_embeddings / (cls_embeddings.norm(dim=1, keepdim=True) + 1e-8)
-
-with open(os.path.join(retrieval_root, "cls_mapping.json"), "r") as f:
-    id_time_to_index = json.load(f)
-n_total = len(id_time_to_index)
+cls_lookup = np.load(os.path.join(retrieval_root, "cls_lookup.npz"))
+cls_key_sorted = cls_lookup["key_sorted"].astype(np.uint64, copy=False)
+cls_row_ids_sorted = cls_lookup["row_ids_sorted"].astype(np.int64, copy=False)
+n_total = int(cls_entity_ids.size(0))
 
 # Load checkpoint: always use pretrained transformer (no separate retriever checkpoint)
 ckpt_path = os.path.join(args.results_path, "transformers", f"{args.dataset}_{args.task}_{args.backbone}.pth")
@@ -264,10 +270,9 @@ def train_retriever_epoch(loader, model, optimizer, entity_to_sorted_list, n_tot
 
 if args.train_retriever:
     entity_to_sorted_list = defaultdict(list)
-    for key, idx in id_time_to_index.items():
-        parts = key.strip("()").split(",")
-        entity_id = int(parts[0].strip())
-        ts = int(float(parts[1].strip()))
+    for idx in range(n_total):
+        entity_id = int(cls_entity_ids[idx].item())
+        ts = int(cls_timestamps[idx].item())
         entity_to_sorted_list[entity_id].append((ts, idx))
     for eid in entity_to_sorted_list:
         entity_to_sorted_list[eid].sort(key=lambda x: x[0])
@@ -347,6 +352,19 @@ def retrieve_topk_for_split(split_name, loader):
     )
 
 
+def lookup_row_indices(entity_ids_tensor, timestamps_tensor, key_sorted, row_ids_sorted):
+    """Vectorized lookup for (entity_id, timestamp) -> row index; returns int64 array with -1 for missing."""
+    eids = entity_ids_tensor.detach().cpu().numpy().astype(np.uint64)
+    ts = timestamps_tensor.detach().cpu().long().numpy().astype(np.uint64)
+    query = (eids << np.uint64(32)) | (ts & np.uint64(0xFFFFFFFF))
+    pos = np.searchsorted(key_sorted, query)
+    idx = np.full(query.shape[0], -1, dtype=np.int64)
+    in_bounds = pos < key_sorted.shape[0]
+    found = np.zeros(query.shape[0], dtype=bool)
+    found[in_bounds] = key_sorted[pos[in_bounds]] == query[in_bounds]
+    idx[found] = row_ids_sorted[pos[found]]
+    return idx
+
 os.makedirs(retrieval_root, exist_ok=True)
 top5_train, entity_train, ts_train = retrieve_topk_for_split("train", ar_loader_dict["train"])
 top5_val, entity_val, ts_val = retrieve_topk_for_split("val", ar_loader_dict["val"])
@@ -358,10 +376,18 @@ for top5, entity_ids, timestamps in [
     (top5_val, entity_val, ts_val),
     (top5_test, entity_test, ts_test),
 ]:
-    for i in range(len(entity_ids)):
-        key = f"({entity_ids[i].item()}, {float(timestamps[i].item())})"
-        idx = id_time_to_index[key]
-        top5_result[idx] = top5[i]
+    row_idx = lookup_row_indices(entity_ids, timestamps, cls_key_sorted, cls_row_ids_sorted)
+    valid = row_idx >= 0
+    if np.any(valid):
+        top5_result[torch.from_numpy(row_idx[valid]).long()] = top5[torch.from_numpy(valid).bool()]
 
-torch.save(top5_result, os.path.join(retrieval_root, "top5_indices.pt"))
-print(f"Saved top5 indices to {retrieval_root} (order matches cls_embeddings / cls_mapping)")
+np.save(
+    os.path.join(retrieval_root, "top5_indices.npy"),
+    top5_result.numpy().astype(np.int64, copy=False),
+)
+print(f"Saved top5 indices to {retrieval_root} (order matches cls_embeddings / cls_lookup)")
+
+# Explicitly release memory at the end of the run to avoid buildup across repeated experiments.
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()

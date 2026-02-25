@@ -429,11 +429,11 @@ class RelTS_Model(nn.Module):
         """Forward pass for samples with valid context."""
         h = self._encode_sequence(batch)
         
-        # Predict from last position (target)
-        # Note: Target position can see all history but not its own label (masked)
-        target_repr = h[:, -1, :]  # (batch, embed_dim)
+        # Predict from CLS token representation.
+        # This aligns the prediction representation with encode_cls() outputs.
+        cls_repr = h[:, 0, :]  # (batch, embed_dim)
         
-        logits = self.classifier(target_repr)  # (batch, num_classes)
+        logits = self.classifier(cls_repr)  # (batch, num_classes)
         
         return logits
 
