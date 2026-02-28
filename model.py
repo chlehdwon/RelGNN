@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Dict
+from typing import List, Dict, Union, Optional
 from torch import Tensor
 from torch_geometric.typing import NodeType
 from torch_geometric.nn import PositionalEncoding
+from relbench.base import TaskType
 
 
 # ---------------------------------------------------------------------------
@@ -156,36 +157,81 @@ class HeteroTemporalEncoder(torch.nn.Module):
         return self.lin(encoded)
 
 
-class LabelEmbedder(nn.Module):
+class ClassificationLabelEmbedder(nn.Module):
     """
-    Embed binary classification labels (0, 1) or mask token.
+    Embed discrete classification labels (e.g. 0, 1 for binary) or mask token.
     """
-    def __init__(self, embed_dim: int):
+    def __init__(self, embed_dim: int, num_classes: int = 2):
         super().__init__()
-        # Embeddings for label 0, 1, and mask
-        self.label_emb = nn.Embedding(2, embed_dim)  # 0, 1
+        self.num_classes = num_classes
+        self.label_emb = nn.Embedding(num_classes, embed_dim)
         self.mask_emb = nn.Parameter(torch.randn(embed_dim))
-        
+
     def forward(self, labels: Tensor, is_mask: Tensor = None) -> Tensor:
         """
         Args:
-            labels: (batch, seq_len) - 0 or 1 for classification
+            labels: (batch, seq_len) - integer class indices (e.g. 0 or 1 for binary)
             is_mask: (batch, seq_len) - True where label should be masked
         Returns:
             (batch, seq_len, embed_dim)
         """
         batch_size, seq_len = labels.shape
-        device = labels.device
-        
-        # Get label embeddings
-        emb = self.label_emb(labels.long())
-        
-        # Replace with mask embedding where needed
+        # Clamp to valid range for embedding lookup
+        labels_long = labels.long().clamp(0, self.num_classes - 1)
+        emb = self.label_emb(labels_long)
         if is_mask is not None:
             mask_emb_expanded = self.mask_emb.view(1, 1, -1).expand(batch_size, seq_len, -1)
             emb = torch.where(is_mask.unsqueeze(-1), mask_emb_expanded, emb)
-        
         return emb
+
+
+class RegressionLabelEmbedder(nn.Module):
+    """
+    Encode numerical (continuous) labels into d-dimensional embeddings for regression tasks.
+    Uses a small MLP: scalar -> hidden -> embed_dim, plus a learnable mask token.
+    """
+    def __init__(self, embed_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        self.mask_emb = nn.Parameter(torch.randn(embed_dim))
+
+    def reset_parameters(self):
+        for m in self.encoder:
+            if hasattr(m, "reset_parameters"):
+                m.reset_parameters()
+        nn.init.normal_(self.mask_emb, std=0.02)
+
+    def forward(self, labels: Tensor, is_mask: Tensor = None) -> Tensor:
+        """
+        Args:
+            labels: (batch, seq_len) - continuous values (float)
+            is_mask: (batch, seq_len) - True where label should be masked
+        Returns:
+            (batch, seq_len, embed_dim)
+        """
+        batch_size, seq_len = labels.shape
+        # Ensure float and shape (batch*seq_len, 1) for Linear(1, ...)
+        x = labels.float().view(-1, 1)
+        emb = self.encoder(x).view(batch_size, seq_len, -1)
+        if is_mask is not None:
+            mask_emb_expanded = self.mask_emb.view(1, 1, -1).expand(batch_size, seq_len, -1)
+            emb = torch.where(is_mask.unsqueeze(-1), mask_emb_expanded, emb)
+        return emb
+
+
+def build_label_embedder(
+    task_type: TaskType,
+    embed_dim: int,
+    num_classes: int = 2,
+) -> Union[ClassificationLabelEmbedder, RegressionLabelEmbedder]:
+    """Build the appropriate label embedder for the given task type."""
+    if task_type == TaskType.REGRESSION:
+        return RegressionLabelEmbedder(embed_dim=embed_dim)
+    return ClassificationLabelEmbedder(embed_dim=embed_dim, num_classes=num_classes)
 
 
 class RelTS_Model(nn.Module):
@@ -197,15 +243,17 @@ class RelTS_Model(nn.Module):
     
     Args:
         channels: Embedding dimension (from snapshot embeddings)
+        task_type: relbench TaskType (e.g. TaskType.BINARY_CLASSIFICATION, TaskType.REGRESSION).
         num_heads: Number of attention heads
         num_layers: Number of transformer layers
         ff_dim: Feedforward dimension
         dropout: Dropout rate
-        num_classes: Number of output classes (1 for binary, >1 for multiclass)
+        num_classes: Number of output classes (1 for binary/regression, >1 for multiclass)
     """
     def __init__(
         self,
         channels: int,
+        task_type: Optional[TaskType] = None,
         entity_embed_dim: int = None,
         use_entity_embedding: bool = False,
         num_heads: int = 4,
@@ -218,11 +266,16 @@ class RelTS_Model(nn.Module):
         
         self.channels = channels
         self.num_classes = num_classes
-        
+        self.task_type = task_type
+
         # Time and label encoders
-        # Use HeteroTemporalEncoder (node_types not used in our case)
         self.temporal_encoder = HeteroTemporalEncoder(node_types=[], channels=channels)
-        self.label_embedder = LabelEmbedder(channels)
+        num_label_classes = 2 if task_type == TaskType.BINARY_CLASSIFICATION else num_classes
+        self.label_embedder = build_label_embedder(
+            task_type=task_type,
+            embed_dim=channels,
+            num_classes=num_label_classes,
+        )
         if not use_entity_embedding or entity_embed_dim is None:
             self.entity_proj = None
         elif entity_embed_dim == channels:
@@ -268,12 +321,12 @@ class RelTS_Model(nn.Module):
         nn.init.normal_(self.cls_emb, std=0.02)
         nn.init.normal_(self.sep_emb, std=0.02)
         self.pos_encoder.reset_parameters()
-        # label_embedder doesn't have reset_parameters, will use default init
-        # transformer will use default init
-        if self.entity_proj is not None and hasattr(self.entity_proj, 'reset_parameters'):
+        if hasattr(self.label_embedder, "reset_parameters"):
+            self.label_embedder.reset_parameters()
+        if self.entity_proj is not None and hasattr(self.entity_proj, "reset_parameters"):
             self.entity_proj.reset_parameters()
         for module in self.classifier:
-            if hasattr(module, 'reset_parameters'):
+            if hasattr(module, "reset_parameters"):
                 module.reset_parameters()
         
     def forward(self, batch: Dict[str, Tensor]) -> Tensor:
@@ -293,9 +346,6 @@ class RelTS_Model(nn.Module):
         Returns:
             logits: (batch, num_classes) - predictions for target label
         """
-        batch_size = batch['input_embeddings'].size(0)
-        device = batch['input_embeddings'].device
-        
         context_batch = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
         return self._forward_with_context(context_batch)
     
@@ -348,7 +398,8 @@ class RelTS_Model(nn.Module):
             all_time_emb = self.temporal_encoder(seed_time, all_timestamps)
             ref_time_emb = all_time_emb[:, :num_refs]
             time_emb = all_time_emb[:, num_refs:]
-            ref_labels = batch['retrieved_labels'].long().clamp(0, 1)
+            # For regression use float; for classification embedder accepts float and converts to long
+            ref_labels = batch["retrieved_labels"].float()
             all_labels = torch.cat([ref_labels, seq_labels], dim=1)
             all_is_mask = torch.cat([
                 torch.zeros(batch_size, num_refs, dtype=torch.bool, device=device),

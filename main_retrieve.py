@@ -127,6 +127,7 @@ else:
 entity_embed_dim = builder.entity_embeddings.shape[1] if args.use_entity_embedding else None
 model = RelTS_Model(
     channels=channels,
+    task_type=task.task_type,
     entity_embed_dim=entity_embed_dim,
     use_entity_embedding=args.use_entity_embedding,
     num_heads=args.num_heads,

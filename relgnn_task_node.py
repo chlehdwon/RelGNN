@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -36,6 +36,13 @@ parser.add_argument(
     default=os.path.expanduser("/data/starlab/relbench_examples"),
 )
 parser.add_argument("--checkpoint_dir", type=str, default="/data/starlab/ckpts/relgnn/")
+parser.add_argument(
+    "--ckpt_load_mode",
+    type=str,
+    default="compatible",
+    choices=["strict", "compatible"],
+    help="strict: exact state_dict match only, compatible: load overlap for mismatched shapes",
+)
 
 args = parser.parse_args()
 args.backbone_model = "relgnn"
@@ -148,6 +155,42 @@ def test(loader: NeighborLoader) -> np.ndarray:
         pred_list.append(pred.detach().cpu())
     return torch.cat(pred_list, dim=0).numpy()
 
+
+def load_state_dict_compatible(
+    model: torch.nn.Module,
+    checkpoint_path: Path,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Load as many checkpoint weights as possible under schema drift."""
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    model_state = model.state_dict()
+
+    loaded_exact: List[str] = []
+    loaded_partial: List[str] = []
+    skipped: List[str] = []
+
+    for key, src in state_dict.items():
+        if key not in model_state:
+            skipped.append(f"{key} (missing in current model)")
+            continue
+        dst = model_state[key]
+        if src.shape == dst.shape:
+            model_state[key] = src.to(dtype=dst.dtype)
+            loaded_exact.append(key)
+            continue
+        if src.ndim != dst.ndim:
+            skipped.append(f"{key} ({tuple(src.shape)} -> {tuple(dst.shape)})")
+            continue
+
+        # Copy only overlapping tensor region when feature dimensions drift.
+        overlap = tuple(slice(0, min(s, d)) for s, d in zip(src.shape, dst.shape))
+        adapted = dst.clone()
+        adapted[overlap] = src[overlap].to(dtype=dst.dtype)
+        model_state[key] = adapted
+        loaded_partial.append(f"{key} ({tuple(src.shape)} -> {tuple(dst.shape)})")
+
+    model.load_state_dict(model_state, strict=True)
+    return loaded_exact, loaded_partial, skipped
+
 atomic_routes_list = get_atomic_routes(data.edge_types)
 
 model = RelGNN_Model(
@@ -159,11 +202,26 @@ model = RelGNN_Model(
     **model_config,
 ).to(device)
 
-state_dict = torch.load(checkpoint_path)
-
-model.load_state_dict(state_dict)
+if args.ckpt_load_mode == "strict":
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(state_dict)
+else:
+    loaded_exact, loaded_partial, skipped = load_state_dict_compatible(
+        model, checkpoint_path
+    )
+    print(
+        f"[ckpt:{args.ckpt_load_mode}] exact={len(loaded_exact)} "
+        f"partial={len(loaded_partial)} skipped={len(skipped)}"
+    )
+    if loaded_partial:
+        print("[ckpt] partial examples:")
+        for msg in loaded_partial[:10]:
+            print(f"  - {msg}")
+    if skipped:
+        print("[ckpt] skipped examples:")
+        for msg in skipped[:10]:
+            print(f"  - {msg}")
 
 test_pred = test(loader_dict["test"])
 test_metrics = task.evaluate(test_pred)
 print(f"Test metric: {test_metrics[tune_metric]}")
-

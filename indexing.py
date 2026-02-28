@@ -75,7 +75,7 @@ seed_everything(42)
 dataset: Dataset = get_dataset(args.dataset, download=True)
 task: EntityTask = get_task(args.dataset, args.task, download=True)
 
-model_config, loader_config = get_configs(args.dataset, args.task, args.backbone)
+model_config, loader_config, _ = get_configs(args.dataset, args.task, args.backbone)
 
 stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
 try:

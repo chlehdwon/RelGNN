@@ -50,8 +50,34 @@ parser.add_argument("--ref_baseline", type=str, default="retrieval", choices=["r
 parser.add_argument("--report", action="store_true", help="Report results to JSON (same style as main_pretrain)")
 parser.add_argument("--report_path", type=str, default="./results")
 parser.add_argument("--tag", type=str, default="default", help="Tag for the experiment")
+parser.add_argument(
+    "--ignore_train_config",
+    action="store_true",
+    help="If set, ignore train_config from relgnn.utils and use CLI arguments as-is.",
+)
 
 args = parser.parse_args()
+
+# Use train_config from relgnn.utils.get_configs when available; override only if user left CLI at default.
+train_config = None
+if not args.ignore_train_config:
+    try:
+        from relgnn.utils import get_configs
+        res = get_configs(args.dataset, args.task, args.backbone)
+        if res is not None and len(res) == 3:
+            train_config = res[2]
+    except Exception:
+        pass
+
+if train_config:
+    if "lr" in train_config:
+        args.lr = float(train_config["lr"])
+    if "weight_decay" in train_config:
+        args.weight_decay = float(train_config["weight_decay"])
+    if "window_size" in train_config:
+        args.window_size = int(train_config["window_size"])
+    if "seed" in train_config:
+        args.seed = int(train_config["seed"])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if torch.cuda.is_available():
@@ -69,13 +95,28 @@ else:
     raise ValueError(f"Task type {task.task_type} is unsupported")
 
 clamp_min, clamp_max = None, None
-if task.task_type == TaskType.REGRESSION:
+if task.task_type == TaskType.BINARY_CLASSIFICATION:
+    out_channels = 1
+    loss_fn = BCEWithLogitsLoss()
+    tune_metric = "roc_auc"
+    higher_is_better = True
+elif task.task_type == TaskType.REGRESSION:
+    out_channels = 1
+    loss_fn = L1Loss()
+    tune_metric = "mae"
+    higher_is_better = False
+    # Get the clamp value at inference time
     train_table = task.get_table("train")
     clamp_min, clamp_max = np.percentile(
         train_table.df[task.target_col].to_numpy(), [2, 98]
     )
-higher_is_better = task.task_type != TaskType.REGRESSION
-tune_metric = "roc_auc" if task.task_type == TaskType.BINARY_CLASSIFICATION else "mae" if task.task_type == TaskType.REGRESSION else "multilabel_auprc_macro"
+elif task.task_type == TaskType.MULTILABEL_CLASSIFICATION:
+    out_channels = task.num_labels
+    loss_fn = BCEWithLogitsLoss()
+    tune_metric = "multilabel_auprc_macro"
+    higher_is_better = True
+else:
+    raise ValueError(f"Task type {task.task_type} is unsupported")
 
 builder = EntityTimeSeriesBuilder(
     index_path=args.index_path,
@@ -121,6 +162,7 @@ else:
 entity_embed_dim = builder.entity_embeddings.shape[1] if args.use_entity_embedding else None
 model = RelTS_Model(
     channels=channels,
+    task_type=task.task_type,
     entity_embed_dim=entity_embed_dim,
     use_entity_embedding=args.use_entity_embedding,
     num_heads=args.num_heads,
@@ -155,19 +197,12 @@ for split in ("train", "val", "test"):
             if split == "train":
                 train_labels_list.append(float(label))
 
-if task.task_type == TaskType.REGRESSION:
-    train_median = np.median(train_labels_list)
-    cls_labels = torch.zeros(n_total, dtype=torch.long)
-    for i in range(n_total):
-        key = (int(cls_entity_ids[i].item()), int(cls_timestamps[i].item()))
-        cls_labels[i] = 1 if id_time_to_label.get(key, 0.0) > train_median else 0
-else:
-    cls_labels = torch.zeros(n_total, dtype=torch.long)
-    for i in range(n_total):
-        key = (int(cls_entity_ids[i].item()), int(cls_timestamps[i].item()))
-        lbl = id_time_to_label.get(key, 0.0)
-        cls_labels[i] = int(round(lbl)) if task.task_type == TaskType.BINARY_CLASSIFICATION else (1 if lbl != 0 else 0)
-    cls_labels = cls_labels.clamp(0, 1)
+cls_labels = torch.zeros(n_total, dtype=torch.float32)
+for i in range(n_total):
+    key = (int(cls_entity_ids[i].item()), int(cls_timestamps[i].item()))
+    # Use the original target label value for this (entity_id, timestamp).
+    # For regression this is a real value; for classification it is the original class/indicator as stored.
+    cls_labels[i] = float(id_time_to_label.get(key, 0.0))
 
 cls_emb_npy_path = os.path.join(retrieval_root, "cls_embeddings.npy")
 top5_npy_path = os.path.join(retrieval_root, "top5_indices.npy")
@@ -177,7 +212,7 @@ if not os.path.exists(top5_npy_path):
     raise FileNotFoundError(f"Missing retrieval top-k file: {top5_npy_path}")
 cls_embeddings_mm = np.load(cls_emb_npy_path, mmap_mode="r")
 top5_indices_mm = np.load(top5_npy_path, mmap_mode="r")
-cls_labels_np = cls_labels.numpy().astype(np.int64, copy=False)
+cls_labels_np = cls_labels.numpy().astype(np.float32, copy=False)
 cls_timestamps_np = cls_timestamps.numpy().astype(np.int64, copy=False)
 
 # RNG for random ref baseline (reproducible across runs with same seed)
@@ -211,11 +246,11 @@ def augment_batch_with_retrieval(batch):
     flat_idx = np.maximum(top5_for_batch, 0)
 
     retrieved_cls_emb_np = cls_embeddings_mm[flat_idx]  # [B, 5, C], float16 memmap
-    retrieved_labels_np = cls_labels_np[flat_idx]       # [B, 5]
+    retrieved_labels_np = cls_labels_np[flat_idx]       # [B, 5] (real-valued or class labels)
     retrieved_timestamps_np = cls_timestamps_np[flat_idx]  # [B, 5]
 
     retrieved_cls_emb = torch.from_numpy(np.asarray(retrieved_cls_emb_np)).to(device=device, dtype=torch.float32)
-    retrieved_labels = torch.from_numpy(np.asarray(retrieved_labels_np)).to(device=device, dtype=torch.long)
+    retrieved_labels = torch.from_numpy(np.asarray(retrieved_labels_np)).to(device=device, dtype=torch.float32)
     retrieved_timestamps = torch.from_numpy(np.asarray(retrieved_timestamps_np)).to(device=device, dtype=torch.float32)
     retrieved_ref_mask = torch.from_numpy(ref_mask_np).to(device=device, dtype=torch.bool)
     retrieved_cls_emb = retrieved_cls_emb * retrieved_ref_mask.unsqueeze(-1).to(retrieved_cls_emb.dtype)
@@ -237,7 +272,7 @@ def augment_batch_with_random_refs(batch):
     retrieved_timestamps_np = cls_timestamps_np[rand_indices]
 
     batch["retrieved_cls_emb"] = torch.from_numpy(np.asarray(retrieved_cls_emb_np)).to(device=device, dtype=torch.float32)
-    batch["retrieved_labels"] = torch.from_numpy(np.asarray(retrieved_labels_np)).to(device=device, dtype=torch.long)
+    batch["retrieved_labels"] = torch.from_numpy(np.asarray(retrieved_labels_np)).to(device=device, dtype=torch.float32)
     batch["retrieved_timestamps"] = torch.from_numpy(np.asarray(retrieved_timestamps_np)).to(device=device, dtype=torch.float32)
     batch["retrieved_ref_mask"] = torch.ones(B, 5, dtype=torch.bool, device=device)
     return batch
@@ -404,13 +439,19 @@ if args.report:
         "dropout": args.dropout,
         "window_size": args.window_size,
     })
+    # Ensure JSON-serializable types
+    metrics_for_json = {k: float(v) for k, v in test_metrics.items()}
     result_entry = {
-        "seed": args.seed,
-        "best_epoch": best_epoch,
-        "test_metrics": test_metrics,
+        "seed": int(args.seed),
+        "best_epoch": int(best_epoch),
+        "test_metrics": metrics_for_json,
     }
-    if best_val_metric is not None and best_val_metric != -float("inf") and best_val_metric != float("inf"):
-        result_entry["best_val_metric"] = best_val_metric
+    if (
+        best_val_metric is not None
+        and best_val_metric != -float("inf")
+        and best_val_metric != float("inf")
+    ):
+        result_entry["best_val_metric"] = float(best_val_metric)
     all_results.setdefault(hyperparams, {})[timestamp] = result_entry
     with open(results_path, "w") as f:
         json.dump(all_results, f, indent=2)

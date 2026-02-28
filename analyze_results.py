@@ -7,23 +7,32 @@ from collections import defaultdict
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from relbench.base import TaskType
+from relbench.tasks import get_task
 
 
-def _process_one_results(results, stage):
+def _select_metric_value(test_metrics, task_type):
+    if task_type == TaskType.REGRESSION:
+        if "mae" in test_metrics:
+            return test_metrics["mae"]
+        if "r2" in test_metrics:
+            return test_metrics["r2"]
+    else:
+        if "roc_auc" in test_metrics:
+            return test_metrics["roc_auc"]
+        if "multilabel_auprc_macro" in test_metrics:
+            return test_metrics["multilabel_auprc_macro"]
+    return list(test_metrics.values())[0]
+
+
+def _process_one_results(results, stage, task_type, higher_is_better):
     """Build summary rows from one results dict. stage is 'pretrain' or 'predict'."""
     setting_results = defaultdict(lambda: defaultdict(list))
     for setting_str, timestamps in results.items():
         for timestamp, result in timestamps.items():
             seed = result["seed"]
             test_metrics = result["test_metrics"]
-            if "roc_auc" in test_metrics:
-                metric_value = test_metrics["roc_auc"]
-            elif "mae" in test_metrics:
-                metric_value = test_metrics["mae"]
-            elif "multilabel_auprc_macro" in test_metrics:
-                metric_value = test_metrics["multilabel_auprc_macro"]
-            else:
-                metric_value = list(test_metrics.values())[0]
+            metric_value = _select_metric_value(test_metrics, task_type)
             setting_results[setting_str][seed].append(metric_value)
 
     rows = []
@@ -31,8 +40,10 @@ def _process_one_results(results, stage):
         setting = json.loads(setting_str)
         seed_to_mean = {seed: np.mean(values) for seed, values in seed_dict.items()}
         seed_means = list(seed_to_mean.values())
-        # Best seed: the seed that achieved the highest metric for this setting
-        best_seed = max(seed_to_mean.keys(), key=lambda s: seed_to_mean[s])
+        if higher_is_better:
+            best_seed = max(seed_to_mean.keys(), key=lambda s: seed_to_mean[s])
+        else:
+            best_seed = min(seed_to_mean.keys(), key=lambda s: seed_to_mean[s])
         best_seed_metric = seed_to_mean[best_seed]
         row = {
             "stage": stage,
@@ -60,6 +71,8 @@ def _process_one_results(results, stage):
 def analyze_results(results_dir, dataset, task):
     """Load pretrain and predict JSONs (if present), merge by stage, write one summary CSV."""
     results_dir = Path(results_dir)
+    task_obj = get_task(dataset, task, download=True)
+    higher_is_better = task_obj.task_type != TaskType.REGRESSION
     base_name = f"{dataset}_{task}"
     pretrain_path = results_dir / f"{base_name}.json"
     predict_path = results_dir / f"{base_name}_predict.json"
@@ -68,11 +81,25 @@ def analyze_results(results_dir, dataset, task):
     if pretrain_path.exists():
         with open(pretrain_path, "r") as f:
             pretrain_results = json.load(f)
-        rows.extend(_process_one_results(pretrain_results, stage="pretrain"))
+        rows.extend(
+            _process_one_results(
+                pretrain_results,
+                stage="pretrain",
+                task_type=task_obj.task_type,
+                higher_is_better=higher_is_better,
+            )
+        )
     if predict_path.exists():
         with open(predict_path, "r") as f:
             predict_results = json.load(f)
-        rows.extend(_process_one_results(predict_results, stage="predict"))
+        rows.extend(
+            _process_one_results(
+                predict_results,
+                stage="predict",
+                task_type=task_obj.task_type,
+                higher_is_better=higher_is_better,
+            )
+        )
 
     if not rows:
         print(f"Error: No result files found for {dataset}/{task}.")
@@ -80,10 +107,10 @@ def analyze_results(results_dir, dataset, task):
         exit(1)
 
     df = pd.DataFrame(rows)
-    # Sort by stage (pretrain first) then by mean_metric (higher first)
+    # Sort by stage (pretrain first) then by metric direction per task type.
     df = df.sort_values(
         ["stage", "mean_metric"],
-        ascending=[True, False],
+        ascending=[True, not higher_is_better],
         kind="stable",
     ).reset_index(drop=True)
 

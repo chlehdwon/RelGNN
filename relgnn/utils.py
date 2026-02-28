@@ -11,7 +11,7 @@ def get_configs(dataset, task, backbone_model):
             'num_layers': 2,
             'subgraph_type': 'directional',
         }
-        return model_config, loader_config 
+        return model_config, loader_config, None
     
     if backbone_model == "relgnn":
         if dataset == 'rel-amazon' and task == 'user-churn':
@@ -27,7 +27,12 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            train_config = {
+                "lr": 0.0001,
+                "weight_decay": 0.0,
+                "window_size": 16,
+            }
+            return model_config, loader_config, train_config
         
         if dataset == 'rel-amazon' and task == 'item-churn':
             model_config = {
@@ -42,7 +47,12 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config      
+            train_config = {
+                "lr": 0.001,
+                "weight_decay": 0.0,
+                "window_size": 16,
+            }
+            return model_config, loader_config, train_config      
         
         if dataset == 'rel-avito' and task == 'user-clicks':
             model_config = {
@@ -57,7 +67,12 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            train_config = {
+                "lr": 0.001,
+                "weight_decay": 0.0,
+                "window_size": 8,
+            }
+            return model_config, loader_config, train_config
 
         if dataset == 'rel-avito' and task == 'user-visits':
             model_config = {
@@ -72,7 +87,13 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'bidirectional',
             }
-            return model_config, loader_config
+            train_config = {
+                "lr": 0.001,
+                "weight_decay": 0.0,
+                "window_size": 8,
+                "seed": 2
+            }
+            return model_config, loader_config, train_config
         
         if dataset == 'rel-event' and task == 'user-repeat':
             model_config = {
@@ -87,7 +108,7 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
         
         if dataset == 'rel-event' and task == 'user-ignore':
             model_config = {
@@ -102,7 +123,7 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
 
         if dataset == 'rel-f1' and task == 'driver-dnf':
             model_config = {
@@ -117,7 +138,12 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            train_config = {
+                "lr": 0.00001,
+                "weight_decay": 0.0,
+                "window_size": 8
+            }
+            return model_config, loader_config, train_config
         
         if dataset == 'rel-f1' and task == 'driver-top3':
             model_config = {
@@ -133,7 +159,13 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            train_config = {
+                "lr": 0.001,
+                "weight_decay": 0.0,
+                "window_size": 32,
+                "seed": 3
+            }
+            return model_config, loader_config, train_config
         
         if dataset == 'rel-hm' and task == 'user-churn':
             model_config = {
@@ -148,7 +180,7 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
         
         if dataset == 'rel-stack' and task == 'user-engagement':
             model_config = {
@@ -163,7 +195,7 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
         
         if dataset == 'rel-stack' and task == 'user-badge':
             model_config = {
@@ -178,7 +210,7 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
         
         if dataset == 'rel-trial' and task == 'study-outcome':
             model_config = {
@@ -193,7 +225,7 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'bidirectional',
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
         
         if dataset == 'rel-amazon' and task == 'user-ltv':
             model_config = {
@@ -208,7 +240,13 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'bidirectional',
             }
-            return model_config, loader_config
+            train_config = {
+                "lr": 1e-05,
+                "weight_decay": 0.0,
+                "window_size": 8,
+                "seed": 1
+            }
+            return model_config, loader_config, train_config
         
         if dataset == 'rel-amazon' and task == 'item-ltv':
             model_config = {
@@ -223,7 +261,13 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            train_config = {
+                "lr": 0.001,
+                "weight_decay": 0.0,
+                "window_size": 16,
+                "seed": 2
+            }
+            return model_config, loader_config, train_config
 
         if dataset == 'rel-avito' and task == 'ad-ctr':
             model_config = {
@@ -238,7 +282,13 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'bidirectional',
             }
-            return model_config, loader_config
+            train_config = {
+                "lr": 1e-05,
+                "weight_decay": 0.0,
+                "window_size": 8,
+                "seed": 1
+            }
+            return model_config, loader_config, train_config
         
         if dataset == 'rel-event' and task == 'user-attendance':
             model_config = {
@@ -253,7 +303,7 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
 
         if dataset == 'rel-f1' and task == 'driver-position':
             model_config = {
@@ -268,7 +318,13 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'bidirectional',
             }
-            return model_config, loader_config
+            train_config =  {
+                "lr": 1e-05,
+                "weight_decay": 0.0,
+                "window_size": 8,
+                "seed": 1
+            }
+            return model_config, loader_config, train_config
 
         if dataset == 'rel-hm' and task == 'item-sales':
             model_config = {
@@ -283,7 +339,7 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
         
         if dataset == 'rel-stack' and task == 'post-votes':
             model_config = {
@@ -298,7 +354,13 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            train_config = {
+                "lr": 0.001,
+                "weight_decay": 0.0,
+                "window_size": 8,
+                "seed": 3
+            }
+            return model_config, loader_config, train_config
         
         if dataset == 'rel-trial' and task == 'study-adverse':
             model_config = {
@@ -313,7 +375,7 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
 
         if dataset == 'rel-trial' and task == 'site-success':
             model_config = {
@@ -328,7 +390,7 @@ def get_configs(dataset, task, backbone_model):
                 'num_layers': 2,
                 'subgraph_type': 'directional',
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
         
         
         if dataset == 'rel-amazon' and task == 'user-item-purchase':
@@ -338,7 +400,7 @@ def get_configs(dataset, task, backbone_model):
             loader_config = {
                 'batch_size': 4096,
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
 
         if dataset == 'rel-amazon' and task == 'user-item-rate':
             model_config = {
@@ -347,7 +409,7 @@ def get_configs(dataset, task, backbone_model):
             loader_config = {
                 'batch_size': 512,
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
 
         if dataset == 'rel-amazon' and task == 'user-item-review':
             model_config = {
@@ -356,7 +418,7 @@ def get_configs(dataset, task, backbone_model):
             loader_config = {
                 'batch_size': 256,
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
 
         if dataset == 'rel-avito' and task == 'user-ad-visit':
             model_config = {
@@ -367,7 +429,7 @@ def get_configs(dataset, task, backbone_model):
                 'batch_size': 256,
                 'num_layers': 2,
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
 
         if dataset == 'rel-hm' and task == 'user-item-purchase':
             model_config = {
@@ -378,7 +440,7 @@ def get_configs(dataset, task, backbone_model):
                 'batch_size': 2048,
                 'num_layers': 2,
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
         
         if dataset == 'rel-stack' and task == 'user-post-comment':
             model_config = {
@@ -389,7 +451,7 @@ def get_configs(dataset, task, backbone_model):
                 'batch_size': 128,
                 'num_layers': 2,
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
 
         if dataset == 'rel-stack' and task == 'post-post-related':
             model_config = {
@@ -400,7 +462,7 @@ def get_configs(dataset, task, backbone_model):
                 'batch_size': 512,
                 'num_layers': 2,
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
 
         if dataset == 'rel-trial' and task == 'condition-sponsor-run':
             model_config = {
@@ -411,7 +473,7 @@ def get_configs(dataset, task, backbone_model):
                 'batch_size': 128,
                 'num_layers': 4,
             }
-            return model_config, loader_config
+            return model_config, loader_config, None
         
         if dataset == 'rel-trial' and task == 'site-sponsor-run':
             model_config = {
@@ -422,4 +484,4 @@ def get_configs(dataset, task, backbone_model):
                 'batch_size': 64,
                 'num_layers': 4,
             }
-            return model_config, loader_config
+            return model_config, loader_config, None

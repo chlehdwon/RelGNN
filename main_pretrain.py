@@ -92,6 +92,11 @@ parser.add_argument("--verbose", action="store_true", help="Show detailed statis
 parser.add_argument("--save", action="store_true", help="Save results")
 parser.add_argument("--report", action="store_true", help="Report results")
 parser.add_argument("--report_path", type=str, default="./results")
+parser.add_argument(
+    "--ignore_train_config",
+    action="store_true",
+    help="If set, ignore train_config from relgnn.utils and use CLI arguments as-is.",
+)
 parser.add_argument("--tag", type=str, default="default", help="Tag for the experiment")
 parser.add_argument(
     "--use_entity_embedding",
@@ -101,6 +106,27 @@ parser.add_argument(
 
  
 args = parser.parse_args()
+
+# Use train_config from relgnn.utils.get_configs when available.
+train_config = None
+if not args.ignore_train_config:
+    try:
+        from relgnn.utils import get_configs
+        res = get_configs(args.dataset, args.task, args.backbone)
+        if res is not None and len(res) == 3:
+            train_config = res[2]
+    except Exception:
+        pass
+
+if train_config:
+    if "lr" in train_config:
+        args.lr = float(train_config["lr"])
+    if "weight_decay" in train_config:
+        args.weight_decay = float(train_config["weight_decay"])
+    if "window_size" in train_config:
+        args.window_size = int(train_config["window_size"])
+    if "seed" in train_config:
+        args.seed = int(train_config["seed"])
 
 # Construct checkpoint path: /data/relts/ckpts/{backbone}/{dataset}_{task}.pth
 checkpoint_path = Path(f"/data/relts/ckpts/{args.backbone}") / f"{args.dataset}_{args.task}.pth"
@@ -243,6 +269,7 @@ else:
 entity_embed_dim = builder.entity_embeddings.shape[1] if args.use_entity_embedding else None
 model = RelTS_Model(
     channels=channels,
+    task_type=task.task_type,
     entity_embed_dim=entity_embed_dim,
     use_entity_embedding=args.use_entity_embedding,
     num_heads=args.num_heads,
@@ -487,13 +514,15 @@ if args.report:
         "dropout": args.dropout,
         "window_size": args.window_size,
     })
+    # Ensure JSON-serializable types (cast numpy scalars to Python float/int)
+    metrics_for_json = {k: float(v) for k, v in test_metrics.items()}
     result_entry = {
-        "seed": args.seed,
-        "best_epoch": best_epoch,
-        "test_metrics": test_metrics,
+        "seed": int(args.seed),
+        "best_epoch": int(best_epoch),
+        "test_metrics": metrics_for_json,
     }
     if best_val_metric is not None:
-        result_entry["best_val_metric"] = best_val_metric
+        result_entry["best_val_metric"] = float(best_val_metric)
     
     all_results.setdefault(str(hyperparams), {})[timestamp] = result_entry
 
