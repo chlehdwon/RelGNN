@@ -379,7 +379,7 @@ class RelTS_Model(nn.Module):
         # 3. Encode time and labels (fused in retrieval path to avoid duplicate encoder calls)
         seed_time = batch['target_timestamp']  # (batch,)
         use_retrieval = 'retrieved_cls_emb' in batch and 'retrieved_labels' in batch
-        num_refs = 5
+        num_refs = int(batch["retrieved_labels"].size(1)) if use_retrieval else 0
 
         # 3b. Add entity embeddings if provided
         if self.entity_proj is not None and 'input_entity_embeddings' in batch and 'target_entity_embedding' in batch:
@@ -414,7 +414,7 @@ class RelTS_Model(nn.Module):
                 ref_tokens = ref_tokens * retrieved_ref_mask.unsqueeze(-1).float()
             cls_emb = self.cls_emb.expand(batch_size, -1, -1)
             sep_emb = self.sep_emb.expand(batch_size, -1, -1)
-            # [CLS] [ref_1] ... [ref_5] [SEP] [ctx1] ... [ctx_k] [target]
+            # [CLS] [ref_1] ... [ref_k] [SEP] [ctx1] ... [ctx_k] [target]
             seq_embeddings = torch.cat([
                 cls_emb,
                 ref_tokens,
@@ -492,5 +492,4 @@ class RelTS_Model(nn.Module):
         """Return CLS embedding for each sample."""
         h = self._encode_sequence(batch)
         return h[:, 0, :]
-
 

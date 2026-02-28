@@ -44,9 +44,10 @@ parser.add_argument("--num_layers", type=int, default=4)
 parser.add_argument("--ff_dim", type=int, default=512)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--mode", type=str, default="recent", choices=["recent", "random"])
+parser.add_argument("--top_k", type=int, default=5, help="Number of retrieved references to use at prediction time")
 parser.add_argument("--use_entity_embedding", action=argparse.BooleanOptionalAction)
 parser.add_argument("--ref_baseline", type=str, default="retrieval", choices=["retrieval", "random"],
-                    help="retrieval: use top-5 retrieved refs; random: random augmentation baseline (sample 5 random refs from index)")
+                    help="retrieval: use retrieved refs; random: random augmentation baseline")
 parser.add_argument("--report", action="store_true", help="Report results to JSON (same style as main_pretrain)")
 parser.add_argument("--report_path", type=str, default="./results")
 parser.add_argument("--tag", type=str, default="default", help="Tag for the experiment")
@@ -212,6 +213,17 @@ if not os.path.exists(top5_npy_path):
     raise FileNotFoundError(f"Missing retrieval top-k file: {top5_npy_path}")
 cls_embeddings_mm = np.load(cls_emb_npy_path, mmap_mode="r")
 top5_indices_mm = np.load(top5_npy_path, mmap_mode="r")
+if args.top_k <= 0:
+    raise ValueError(f"--top_k must be >= 1, got {args.top_k}")
+if top5_indices_mm.ndim != 2:
+    raise ValueError(f"Expected top-k index array with 2 dims, got shape {top5_indices_mm.shape}")
+available_top_k = int(top5_indices_mm.shape[1])
+effective_top_k = min(args.top_k, available_top_k)
+if effective_top_k < args.top_k:
+    print(
+        f"Requested top_k={args.top_k}, but only {available_top_k} refs are available in index. "
+        f"Using top_k={effective_top_k}."
+    )
 cls_labels_np = cls_labels.numpy().astype(np.float32, copy=False)
 cls_timestamps_np = cls_timestamps.numpy().astype(np.int64, copy=False)
 
@@ -241,13 +253,13 @@ def augment_batch_with_retrieval(batch):
     batch_idx = lookup_row_indices(entity_ids, timestamps, cls_key_sorted, cls_row_ids_sorted)  # np.int64 [B]
 
     batch_idx_safe = np.maximum(batch_idx, 0)
-    top5_for_batch = top5_indices_mm[batch_idx_safe]  # np.int64 [B, 5]
+    top5_for_batch = top5_indices_mm[batch_idx_safe, :effective_top_k]  # np.int64 [B, K]
     ref_mask_np = (batch_idx[:, None] >= 0) & (top5_for_batch >= 0)
     flat_idx = np.maximum(top5_for_batch, 0)
 
-    retrieved_cls_emb_np = cls_embeddings_mm[flat_idx]  # [B, 5, C], float16 memmap
-    retrieved_labels_np = cls_labels_np[flat_idx]       # [B, 5] (real-valued or class labels)
-    retrieved_timestamps_np = cls_timestamps_np[flat_idx]  # [B, 5]
+    retrieved_cls_emb_np = cls_embeddings_mm[flat_idx]  # [B, K, C], float16 memmap
+    retrieved_labels_np = cls_labels_np[flat_idx]       # [B, K] (real-valued or class labels)
+    retrieved_timestamps_np = cls_timestamps_np[flat_idx]  # [B, K]
 
     retrieved_cls_emb = torch.from_numpy(np.asarray(retrieved_cls_emb_np)).to(device=device, dtype=torch.float32)
     retrieved_labels = torch.from_numpy(np.asarray(retrieved_labels_np)).to(device=device, dtype=torch.float32)
@@ -266,7 +278,7 @@ def augment_batch_with_random_refs(batch):
     """Low-memory random baseline using memmap arrays and per-batch GPU transfer."""
     B = batch["entity_id"].size(0)
     device = batch["input_embeddings"].device
-    rand_indices = rng.integers(0, n_total, size=(B, 5), dtype=np.int64)
+    rand_indices = rng.integers(0, n_total, size=(B, effective_top_k), dtype=np.int64)
     retrieved_cls_emb_np = cls_embeddings_mm[rand_indices]
     retrieved_labels_np = cls_labels_np[rand_indices]
     retrieved_timestamps_np = cls_timestamps_np[rand_indices]
@@ -274,7 +286,7 @@ def augment_batch_with_random_refs(batch):
     batch["retrieved_cls_emb"] = torch.from_numpy(np.asarray(retrieved_cls_emb_np)).to(device=device, dtype=torch.float32)
     batch["retrieved_labels"] = torch.from_numpy(np.asarray(retrieved_labels_np)).to(device=device, dtype=torch.float32)
     batch["retrieved_timestamps"] = torch.from_numpy(np.asarray(retrieved_timestamps_np)).to(device=device, dtype=torch.float32)
-    batch["retrieved_ref_mask"] = torch.ones(B, 5, dtype=torch.bool, device=device)
+    batch["retrieved_ref_mask"] = torch.ones(B, effective_top_k, dtype=torch.bool, device=device)
     return batch
 
 
@@ -361,8 +373,9 @@ def evaluate(loader):
     return avg_loss, metrics
 
 
-print("\nFine-tuning with [CLS] [ref_1..ref_5] [SEP] [ctx...] ...")
+print("\nFine-tuning with [CLS] [ref_1..ref_k] [SEP] [ctx...] ...")
 print(f"Ref baseline: {args.ref_baseline}")
+print(f"Top-k refs used at predict time: {effective_top_k} (requested={args.top_k})")
 print("=" * 80)
 print("Early stopping patience: 5 epochs")
 
@@ -430,6 +443,8 @@ if args.report:
         "stage": "predict",
         "backbone": args.backbone,
         "mode": args.mode,
+        "top_k": args.top_k,
+        "effective_top_k": effective_top_k,
         "ref_baseline": args.ref_baseline,
         "tag": args.tag,
         "lr": args.lr,
