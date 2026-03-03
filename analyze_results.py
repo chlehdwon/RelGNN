@@ -1,5 +1,8 @@
-"""Analyze hyperparameter tuning results and export to CSV.
-Supports both pretrain and predict JSONs; summary CSV includes a 'stage' column (pretrain | predict).
+"""Analyze tuning results and export one summary CSV.
+
+Preferred format:
+- Single merged file: {dataset}_{task}.json
+- Each result entry has "source" (e.g., pretrain | predict | only_predict | predict_vote)
 """
 import json
 import argparse
@@ -26,7 +29,7 @@ def _select_metric_value(test_metrics, task_type):
 
 
 def _process_one_results(results, stage, task_type, higher_is_better):
-    """Build summary rows from one results dict. stage is 'pretrain' or 'predict'."""
+    """Build summary rows from one results dict under a fixed stage label."""
     setting_results = defaultdict(lambda: defaultdict(list))
     for setting_str, timestamps in results.items():
         for timestamp, result in timestamps.items():
@@ -68,34 +71,73 @@ def _process_one_results(results, stage, task_type, higher_is_better):
     return rows
 
 
+def _process_merged_results(results, task_type, higher_is_better):
+    """Build summary rows from merged results dict using entry['source'] as stage."""
+    # Group key: (stage, setting_str) -> seed -> list(metric)
+    grouped = defaultdict(lambda: defaultdict(list))
+    for setting_str, timestamps in results.items():
+        for _timestamp, result in timestamps.items():
+            stage = result.get("source")
+            if stage is None:
+                # Backward-compat: try stage from hyperparam blob, else pretrain default.
+                try:
+                    parsed = json.loads(setting_str)
+                    stage = parsed.get("stage", "pretrain")
+                except Exception:
+                    stage = "pretrain"
+            seed = result["seed"]
+            test_metrics = result["test_metrics"]
+            metric_value = _select_metric_value(test_metrics, task_type)
+            grouped[(stage, setting_str)][seed].append(metric_value)
+
+    rows = []
+    for (stage, setting_str), seed_dict in grouped.items():
+        setting = json.loads(setting_str)
+        seed_to_mean = {seed: np.mean(values) for seed, values in seed_dict.items()}
+        seed_means = list(seed_to_mean.values())
+        if higher_is_better:
+            best_seed = max(seed_to_mean.keys(), key=lambda s: seed_to_mean[s])
+        else:
+            best_seed = min(seed_to_mean.keys(), key=lambda s: seed_to_mean[s])
+        best_seed_metric = seed_to_mean[best_seed]
+        row = {
+            "stage": stage,
+            "backbone": setting.get("backbone", "relgnn"),
+            "mode": setting.get("mode", "recent"),
+            "tag": setting.get("tag", "default"),
+            "lr": setting.get("lr"),
+            "weight_decay": setting.get("weight_decay"),
+            "num_heads": setting.get("num_heads"),
+            "num_layers": setting.get("num_layers"),
+            "dropout": setting.get("dropout"),
+            "window_size": setting.get("window_size"),
+            "top_k": setting.get("top_k"),
+            "ref_baseline": setting.get("ref_baseline"),
+            "mean_metric": np.mean(seed_means),
+            "std_metric": np.std(seed_means, ddof=1) if len(seed_means) > 1 else 0.0,
+            "num_seeds": len(seed_means),
+            "best_seed": best_seed,
+            "best_seed_metric": best_seed_metric,
+        }
+        rows.append(row)
+    return rows
+
+
 def analyze_results(results_dir, dataset, task):
-    """Load pretrain and predict JSONs (if present), merge by stage, write one summary CSV."""
+    """Analyze merged results from one file."""
     results_dir = Path(results_dir)
     task_obj = get_task(dataset, task, download=True)
     higher_is_better = task_obj.task_type != TaskType.REGRESSION
     base_name = f"{dataset}_{task}"
     pretrain_path = results_dir / f"{base_name}.json"
-    predict_path = results_dir / f"{base_name}_predict.json"
 
     rows = []
     if pretrain_path.exists():
         with open(pretrain_path, "r") as f:
             pretrain_results = json.load(f)
         rows.extend(
-            _process_one_results(
+            _process_merged_results(
                 pretrain_results,
-                stage="pretrain",
-                task_type=task_obj.task_type,
-                higher_is_better=higher_is_better,
-            )
-        )
-    if predict_path.exists():
-        with open(predict_path, "r") as f:
-            predict_results = json.load(f)
-        rows.extend(
-            _process_one_results(
-                predict_results,
-                stage="predict",
                 task_type=task_obj.task_type,
                 higher_is_better=higher_is_better,
             )
@@ -103,7 +145,7 @@ def analyze_results(results_dir, dataset, task):
 
     if not rows:
         print(f"Error: No result files found for {dataset}/{task}.")
-        print(f"  Looked for: {pretrain_path}, {predict_path}")
+        print(f"  Looked for: {pretrain_path}")
         exit(1)
 
     df = pd.DataFrame(rows)
@@ -127,7 +169,7 @@ def analyze_results(results_dir, dataset, task):
     print(f"\n{'='*80}")
     print("BEST PER STAGE:")
     print(f"{'='*80}")
-    for stage in ["pretrain", "predict"]:
+    for stage in df["stage"].unique():
         stage_df = df[df["stage"] == stage]
         if stage_df.empty:
             continue

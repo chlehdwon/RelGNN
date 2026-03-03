@@ -1,7 +1,7 @@
 """
-Fine-tune pretrained transformer with retrieved CLS refs:
-  [CLS] [ref_1] ... [ref_5] [SEP] [ctx1] ... [ctx_k] -> predict target.
-Ref token = retrieved cls_embedding + label_embedding (5 retrieved past same-entity snapshots).
+Fine-tune with cross-attention retrieval merge:
+  Base path: [CLS] [ctx1] ... [ctx_k] [target]
+  Retrieved refs are merged into CLS via cross-attention + gating (no ref tokens inserted into base sequence).
 """
 import argparse
 import json
@@ -21,10 +21,10 @@ from relbench.datasets import get_dataset
 from relbench.tasks import get_task
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, mean_absolute_error, mean_squared_error, r2_score
 
-from model import RelTS_Model
+from model_cross import RelTS_Cross_Model
 from dataset import EntityTimeSeriesBuilder, create_ar_dataloaders, create_random_ar_dataloaders
 
-parser = argparse.ArgumentParser(description="Fine-tune with retrieved CLS ref tokens")
+parser = argparse.ArgumentParser(description="Fine-tune with cross-attention retrieval merge")
 parser.add_argument("--dataset", type=str, default="rel-f1")
 parser.add_argument("--task", type=str, default="driver-top3")
 parser.add_argument("--num_workers", type=int, default=0)
@@ -43,14 +43,11 @@ parser.add_argument("--num_heads", type=int, default=4)
 parser.add_argument("--num_layers", type=int, default=4)
 parser.add_argument("--ff_dim", type=int, default=512)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--cross_heads", type=int, default=4, help="Number of heads for cross-attention merge")
+parser.add_argument("--cross_dropout", type=float, default=0.1, help="Dropout for cross-attention merge block")
 parser.add_argument("--mode", type=str, default="recent", choices=["recent", "random"])
 parser.add_argument("--top_k", type=int, default=5, help="Number of retrieved references to use at prediction time")
 parser.add_argument("--use_entity_embedding", action=argparse.BooleanOptionalAction)
-parser.add_argument(
-    "--fm",
-    action="store_true",
-    help="Load FM checkpoint from results_path/transformers_fm instead of results_path/transformers",
-)
 parser.add_argument("--ref_baseline", type=str, default="retrieval", choices=["retrieval", "random"],
                     help="retrieval: use retrieved refs; random: random augmentation baseline")
 parser.add_argument("--report", action="store_true", help="Report results to JSON (same style as main_pretrain)")
@@ -166,7 +163,7 @@ else:
     )
 
 entity_embed_dim = builder.entity_embeddings.shape[1] if args.use_entity_embedding else None
-model = RelTS_Model(
+model = RelTS_Cross_Model(
     channels=channels,
     task_type=task.task_type,
     entity_embed_dim=entity_embed_dim,
@@ -176,13 +173,17 @@ model = RelTS_Model(
     ff_dim=args.ff_dim,
     dropout=args.dropout,
     num_classes=out_channels,
+    cross_heads=args.cross_heads,
+    cross_dropout=args.cross_dropout,
+    use_ref_time_label=True,
+    freeze_backbone=True,
+    train_base_classifier=False,
 ).to(device)
 
-ckpt_dir = "transformers_fm" if args.fm else "transformers"
-pretrained_ckpt = os.path.join(args.results_path, ckpt_dir, f"{args.dataset}_{args.task}_{args.backbone}.pth")
+pretrained_ckpt = os.path.join(args.results_path, "transformers", f"{args.dataset}_{args.task}_{args.backbone}.pth")
 if not os.path.exists(pretrained_ckpt):
     raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_ckpt}")
-model.load_state_dict(torch.load(pretrained_ckpt, map_location=device))
+model.load_base_state_dict(torch.load(pretrained_ckpt, map_location=device))
 
 retrieval_root = os.path.join(args.index_path, args.backbone, args.dataset, args.task)
 cls_meta = torch.load(os.path.join(retrieval_root, "cls_meta.pt"), map_location="cpu")
@@ -310,7 +311,10 @@ elif task.task_type == TaskType.REGRESSION:
 else:
     loss_fn = BCEWithLogitsLoss()
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+trainable_params = [p for p in model.parameters() if p.requires_grad]
+if not trainable_params:
+    raise ValueError("No trainable parameters in cross-merge module.")
+optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
 
 def train_epoch(loader):
@@ -379,9 +383,10 @@ def evaluate(loader):
     return avg_loss, metrics
 
 
-print("\nFine-tuning with [CLS] [ref_1..ref_k] [SEP] [ctx...] ...")
+print("\nFine-tuning with cross-attention retrieval merge")
 print(f"Ref baseline: {args.ref_baseline}")
 print(f"Top-k refs used at predict time: {effective_top_k} (requested={args.top_k})")
+print("freeze_backbone=True (fixed), train_base_classifier=False (fixed)")
 print("=" * 80)
 print("Early stopping patience: 5 epochs")
 
@@ -446,12 +451,17 @@ if args.report:
         all_results = {}
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     hyperparams = json.dumps({
-        "stage": "predict",
+        "stage": "predict_cross",
         "backbone": args.backbone,
         "mode": args.mode,
         "top_k": args.top_k,
         "effective_top_k": effective_top_k,
         "ref_baseline": args.ref_baseline,
+        "cross_heads": args.cross_heads,
+        "cross_dropout": args.cross_dropout,
+        "use_ref_time_label": True,
+        "freeze_backbone": True,
+        "train_base_classifier": False,
         "tag": args.tag,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
@@ -463,7 +473,7 @@ if args.report:
     # Ensure JSON-serializable types
     metrics_for_json = {k: float(v) for k, v in test_metrics.items()}
     result_entry = {
-        "source": "predict",
+        "source": "predict_cross",
         "seed": int(args.seed),
         "best_epoch": int(best_epoch),
         "test_metrics": metrics_for_json,

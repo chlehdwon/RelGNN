@@ -1,0 +1,814 @@
+import os
+# OMP_NUM_THREADS: openmp, OPENBLAS_NUM_THREADS: openblas, MKL_NUM_THREADS: mkl, VECLIB_MAXIMUM_THREADS: accelerate, NUMEXPR_NUM_THREADS: numexpr
+os.environ["OMP_NUM_THREADS"] = "4" # export OMP_NUM_THREADS=4
+os.environ["MKL_NUM_THREADS"] = "4" # export MKL_NUM_THREADS=6
+os.environ["NUMEXPR_NUM_THREADS"] = "4" # export NUMEXPR_NUM_THREADS=6
+# os.environ["OPENBLAS_NUM_THREADS"] = "2" # export OPENBLAS_NUM_THREADS=4
+# os.environ["VECLIB_MAXIMUM_THREADS"] = "2" # export VECLIB_MAXIMUM_THREADS=4
+
+import argparse
+import json
+import os
+import random
+from pathlib import Path
+from datetime import datetime
+import gc
+
+import numpy as np
+import torch
+from torch.nn import BCEWithLogitsLoss, L1Loss
+from torch_frame import stype
+from torch_frame.config.text_embedder import TextEmbedderConfig
+from torch_geometric.seed import seed_everything
+from tqdm import tqdm
+from huggingface_hub import hf_hub_download
+import matplotlib
+matplotlib.use("Agg")
+
+from relbench.base import Dataset, EntityTask, TaskType
+from relbench.datasets import get_dataset
+from relbench.modeling.graph import make_pkey_fkey_graph
+from relbench.modeling.utils import get_stype_proposal
+from relbench.tasks import get_task
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, mean_absolute_error, mean_squared_error, r2_score
+
+from relgnn.text_embedder import GloveTextEmbedding
+
+from model import RelTS_Model
+from util import analyze_by_sequence_length, plot_quartile_results, analyze_cold_start_gap
+from dataset import EntityTimeSeriesBuilder, create_ar_dataloaders, create_random_ar_dataloaders
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--dataset", type=str, default="rel-f1")
+parser.add_argument("--task", type=str, default="driver-top3")
+parser.add_argument("--num_workers", type=int, default=0)
+parser.add_argument(
+    "--cache_dir",
+    type=str,
+    default=os.path.expanduser("/data/starlab/relbench_examples"),
+)
+parser.add_argument(
+    "--backbone",
+    type=str,
+    default="relgnn",
+    choices=["rdl", "relgnn", "relgt"],
+    help="Backbone model type: 'rdl', 'relgnn', or 'relgt'"
+)
+parser.add_argument(
+    "--index_path",
+    type=str,
+    default="/data/relts/snapshots",
+    help="Root path for saving snapshot indices"
+)
+parser.add_argument("--results_path", type=str, default="/data/relts/ckpts")
+parser.add_argument(
+    "--window_size",
+    type=int,
+    default=32,
+    help="Window size for auto-regressive samples"
+)
+parser.add_argument(
+    "--batch_size",
+    type=int,
+    default=512,
+    help="Batch size for AR DataLoader"
+)
+parser.add_argument("--seed", type=int, default=42, help="Random seed")
+parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
+parser.add_argument(
+    "--pretrain_tasks",
+    nargs="*",
+    default=[],
+    help="Optional pretraining tasks before --task. Format: task_name or dataset_name:task_name",
+)
+parser.add_argument(
+    "--pretrain_epochs",
+    type=int,
+    default=0,
+    help="Number of epochs for each pretraining task",
+)
+parser.add_argument(
+    "--pretrain_mode",
+    type=str,
+    default="sequential",
+    choices=["sequential", "mixed"],
+    help="Pretraining mode: 'sequential' (task-by-task) or 'mixed' (interleaved like multitask).",
+)
+parser.add_argument("--max_steps_per_epoch", type=int, default=1000, help="Maximum number of steps per epoch")
+parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
+parser.add_argument("--weight_decay", type=float, default=1e-6, help="Weight decay")
+parser.add_argument("--num_heads", type=int, default=4, help="Number of attention heads")
+parser.add_argument("--num_layers", type=int, default=4, help="Number of transformer layers")
+parser.add_argument("--ff_dim", type=int, default=512, help="Feedforward dimension")
+parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
+parser.add_argument(
+    "--mode",
+    type=str,
+    default="recent",
+    choices=["recent", "random"],
+    help="Sampling mode: 'recent' (standard temporal, default), 'random' (random samples per epoch)"
+)
+parser.add_argument("--verbose", action="store_true", help="Show detailed statistics (sequence stats and quartile analysis)")
+parser.add_argument("--save", action="store_true", help="Save results")
+parser.add_argument("--report", action="store_true", help="Report results")
+parser.add_argument("--report_path", type=str, default="./results")
+parser.add_argument(
+    "--ignore_train_config",
+    action="store_true",
+    help="If set, ignore train_config from relgnn.utils and use CLI arguments as-is.",
+)
+parser.add_argument("--tag", type=str, default="default", help="Tag for the experiment")
+parser.add_argument(
+    "--use_entity_embedding",
+    action=argparse.BooleanOptionalAction,
+    help="Use entity embeddings in model"
+)
+
+ 
+args = parser.parse_args()
+
+# Use train_config from relgnn.utils.get_configs when available.
+train_config = None
+if not args.ignore_train_config:
+    try:
+        from relgnn.utils import get_configs
+        res = get_configs(args.dataset, args.task, args.backbone)
+        if res is not None and len(res) == 3:
+            train_config = res[2]
+    except Exception:
+        pass
+
+if train_config:
+    if "lr" in train_config:
+        args.lr = float(train_config["lr"])
+    if "weight_decay" in train_config:
+        args.weight_decay = float(train_config["weight_decay"])
+    if "window_size" in train_config:
+        args.window_size = int(train_config["window_size"])
+    if "seed" in train_config:
+        args.seed = int(train_config["seed"])
+
+# Construct checkpoint path: /data/relts/ckpts/{backbone}/{dataset}_{task}.pth
+checkpoint_path = Path(f"/data/relts/ckpts/{args.backbone}") / f"{args.dataset}_{args.task}.pth"
+if not checkpoint_path.exists():
+    # Fallback to HuggingFace Hub download for relgnn
+    if args.backbone == "relgnn":
+        checkpoint_path = Path(hf_hub_download(repo_id="tianlangchen/RelGNN", filename=f"{args.dataset}_{args.task}.pth", cache_dir=f"/data/relts/ckpts/{args.backbone}"))
+    else:
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}. Please ensure the checkpoint is available for backbone={args.backbone}")
+assert checkpoint_path.exists(), f"Checkpoint not found at {checkpoint_path}. Please download the checkpoint first."
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    torch.set_num_threads(1)
+seed_everything(args.seed)
+
+def parse_task_spec(task_spec: str, default_dataset: str):
+    if ":" in task_spec:
+        dataset_name, task_name = task_spec.split(":", 1)
+        return dataset_name.strip(), task_name.strip()
+    return default_dataset, task_spec.strip()
+
+
+def get_task_setup(task: EntityTask):
+    clamp_min, clamp_max = None, None
+    if task.task_type == TaskType.BINARY_CLASSIFICATION:
+        return {
+            "out_channels": 1,
+            "loss_fn": BCEWithLogitsLoss(),
+            "tune_metric": "roc_auc",
+            "higher_is_better": True,
+            "clamp_min": clamp_min,
+            "clamp_max": clamp_max,
+        }
+    if task.task_type == TaskType.REGRESSION:
+        train_table = task.get_table("train")
+        clamp_min, clamp_max = np.percentile(
+            train_table.df[task.target_col].to_numpy(), [2, 98]
+        )
+        return {
+            "out_channels": 1,
+            "loss_fn": L1Loss(),
+            "tune_metric": "mae",
+            "higher_is_better": False,
+            "clamp_min": clamp_min,
+            "clamp_max": clamp_max,
+        }
+    if task.task_type == TaskType.MULTILABEL_CLASSIFICATION:
+        return {
+            "out_channels": task.num_labels,
+            "loss_fn": BCEWithLogitsLoss(),
+            "tune_metric": "multilabel_auprc_macro",
+            "higher_is_better": True,
+            "clamp_min": clamp_min,
+            "clamp_max": clamp_max,
+        }
+    raise ValueError(f"Task type {task.task_type} is unsupported")
+
+
+def print_sequence_stats(builder: EntityTimeSeriesBuilder):
+    print("\n" + "=" * 80)
+    print("Entity Sequence Statistics")
+    print("=" * 80)
+    for split in ["train", "val", "test"]:
+        sequences = builder.entity_sequences[split]
+        seq_lengths = [len(seq) for seq in sequences.values()]
+        if len(seq_lengths) > 0:
+            print(f"\n{split.upper()} Split:")
+            print(f"  Number of entities: {len(sequences)}")
+            print(f"  Average sequence length: {np.mean(seq_lengths):.2f}")
+            print(f"  Median sequence length: {np.median(seq_lengths):.0f}")
+            print(f"  Min sequence length: {np.min(seq_lengths)}")
+            print(f"  Max sequence length: {np.max(seq_lengths)}")
+            print(f"  Std sequence length: {np.std(seq_lengths):.2f}")
+    print("=" * 80 + "\n")
+
+
+def prepare_task_context(dataset_name: str, task_name: str, show_stats: bool = False):
+    dataset: Dataset = get_dataset(dataset_name, download=True)
+    task: EntityTask = get_task(dataset_name, task_name, download=True)
+
+    stypes_cache_path = Path(f"{args.cache_dir}/{dataset_name}/stypes.json")
+    try:
+        with open(stypes_cache_path, "r") as f:
+            col_to_stype_dict = json.load(f)
+        for table, col_to_stype in col_to_stype_dict.items():
+            for col, stype_str in col_to_stype.items():
+                col_to_stype[col] = stype(stype_str)
+    except FileNotFoundError:
+        col_to_stype_dict = get_stype_proposal(dataset.get_db())
+        Path(stypes_cache_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(stypes_cache_path, "w") as f:
+            json.dump(col_to_stype_dict, f, indent=2, default=str)
+
+    make_pkey_fkey_graph(
+        dataset.get_db(),
+        col_to_stype_dict=col_to_stype_dict,
+        text_embedder_cfg=TextEmbedderConfig(
+            text_embedder=GloveTextEmbedding(device=device), batch_size=256
+        ),
+        cache_dir=f"{args.cache_dir}/{dataset_name}/materialized",
+    )
+
+    builder = EntityTimeSeriesBuilder(
+        index_path=args.index_path,
+        dataset_name=dataset_name,
+        task_name=task_name,
+        task=task,
+        backbone=args.backbone,
+        use_random_embedding=False,
+    )
+
+    channels = None
+    for split in ["train", "val", "test"]:
+        sequences = builder.entity_sequences[split]
+        if len(sequences) > 0:
+            first_entity_seq = next(iter(sequences.values()))
+            if len(first_entity_seq) > 0:
+                channels = first_entity_seq[0][1].shape[0]
+                break
+    if channels is None:
+        raise ValueError(f"Could not determine embedding dimension from snapshots for {dataset_name}:{task_name}")
+
+    print(f"\n[Task {dataset_name}:{task_name}] Model embedding dimension (from snapshot): {channels}")
+    if args.verbose and show_stats:
+        print_sequence_stats(builder)
+
+    if args.mode == "recent":
+        print("Using 'recent' mode (standard temporal setting):")
+        ar_loader_dict = create_ar_dataloaders(
+            entity_sequences=builder.entity_sequences,
+            split_indices=builder.split_indices,
+            window_size=args.window_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            min_input_length=0,
+        )
+    elif args.mode == "random":
+        print("Using 'random' mode (random sampling per epoch):")
+        ar_loader_dict = create_random_ar_dataloaders(
+            entity_sequences=builder.entity_sequences,
+            split_indices=builder.split_indices,
+            window_size=args.window_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            min_input_length=0,
+            samples_per_epoch=None,
+            seed=args.seed,
+        )
+    else:
+        raise ValueError(f"Unknown mode: {args.mode}")
+
+    setup = get_task_setup(task)
+    setup.update(
+        {
+            "dataset_name": dataset_name,
+            "task_name": task_name,
+            "task": task,
+            "builder": builder,
+            "channels": channels,
+            "ar_loader_dict": ar_loader_dict,
+        }
+    )
+    return setup
+
+# Training function
+def train(model, loader, optimizer, loss_fn, task_type, device):
+    model.train()
+    total_loss = 0
+    total_samples = 0
+    steps = 0
+    total_steps = min(len(loader), args.max_steps_per_epoch)
+    
+    for batch in tqdm(loader, desc="Training", total=total_steps):
+        # Move batch to device
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                 for k, v in batch.items()}
+
+        # Forward pass
+        logits = model(batch)
+        target = batch['target_label']
+        
+        # Compute loss
+        if task_type == TaskType.BINARY_CLASSIFICATION:
+            loss = loss_fn(logits.squeeze(-1), target)
+        elif task_type == TaskType.REGRESSION:
+            loss = loss_fn(logits.squeeze(-1), target)
+        else:  # MULTILABEL_CLASSIFICATION
+            loss = loss_fn(logits, target)
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        total_loss += loss.item() * batch['target_label'].size(0)
+        total_samples += batch['target_label'].size(0)
+        
+        steps += 1
+        if steps >= args.max_steps_per_epoch:
+            break
+    
+    return total_loss / total_samples
+
+@torch.no_grad()
+def evaluate(
+    model,
+    loader,
+    loss_fn,
+    task_type,
+    device,
+    clamp_min=None,
+    clamp_max=None,
+    return_sequence_lengths=False,
+    return_preds_targets=False,
+):
+    model.eval()
+    total_loss = 0
+    total_samples = 0
+    all_preds = []
+    all_targets = []
+    all_seq_lengths = []
+
+    for batch in tqdm(loader, desc="Evaluating"):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+        logits = model(batch)
+        target = batch["target_label"]
+
+        if return_sequence_lengths:
+            seq_lengths = batch["input_mask"].sum(dim=1).cpu().numpy()
+            all_seq_lengths.append(seq_lengths)
+
+        if task_type == TaskType.BINARY_CLASSIFICATION:
+            loss = loss_fn(logits.squeeze(-1), target)
+            preds = torch.sigmoid(logits.squeeze(-1))
+        elif task_type == TaskType.REGRESSION:
+            loss = loss_fn(logits.squeeze(-1), target)
+            preds = logits.squeeze(-1)
+            if clamp_min is not None:
+                preds = preds.clamp(clamp_min, clamp_max)
+        else:
+            loss = loss_fn(logits, target)
+            preds = torch.sigmoid(logits)
+
+        total_loss += loss.item() * target.size(0)
+        total_samples += target.size(0)
+        all_preds.append(preds.cpu())
+        all_targets.append(target.cpu())
+
+    avg_loss = total_loss / total_samples
+    all_preds = torch.cat(all_preds, dim=0).numpy()
+    all_targets = torch.cat(all_targets, dim=0).numpy()
+
+    metrics_dict = {}
+    if task_type == TaskType.BINARY_CLASSIFICATION:
+        metrics_dict["roc_auc"] = roc_auc_score(all_targets, all_preds)
+        metrics_dict["accuracy"] = accuracy_score(all_targets, (all_preds > 0.5).astype(int))
+        metrics_dict["f1"] = f1_score(all_targets, (all_preds > 0.5).astype(int))
+    elif task_type == TaskType.REGRESSION:
+        metrics_dict["mae"] = mean_absolute_error(all_targets, all_preds)
+        metrics_dict["rmse"] = np.sqrt(mean_squared_error(all_targets, all_preds))
+        metrics_dict["r2"] = r2_score(all_targets, all_preds)
+
+    return_values = [avg_loss, metrics_dict]
+    if return_sequence_lengths:
+        all_seq_lengths = np.concatenate(all_seq_lengths)
+        return_values.append(all_seq_lengths)
+    if return_preds_targets:
+        return_values.extend([all_preds, all_targets])
+
+    if len(return_values) == 2:
+        return avg_loss, metrics_dict
+    return tuple(return_values)
+
+
+def train_phase(model, phase_context, epochs, phase_name):
+    print(f"\nStarting {phase_name} training for {epochs} epochs...")
+    print("=" * 80)
+    print("Early stopping patience: 5 epochs")
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    best_val_metric = -float("inf") if phase_context["higher_is_better"] else float("inf")
+    best_epoch = 0
+    best_state_dict = None
+    patience = 5
+    patience_counter = 0
+
+    for epoch in range(1, epochs + 1):
+        print(f"\nEpoch {epoch}/{epochs}")
+        print("-" * 80)
+
+        train_loss = train(
+            model,
+            phase_context["ar_loader_dict"]["train"],
+            optimizer,
+            phase_context["loss_fn"],
+            phase_context["task"].task_type,
+            device,
+        )
+        print(f"Train Loss: {train_loss:.4f}")
+
+        val_loss, val_metrics = evaluate(
+            model,
+            phase_context["ar_loader_dict"]["val"],
+            phase_context["loss_fn"],
+            phase_context["task"].task_type,
+            device,
+            clamp_min=phase_context["clamp_min"],
+            clamp_max=phase_context["clamp_max"],
+        )
+        print(f"Val Loss: {val_loss:.4f}")
+        print(f"Val Metrics: {val_metrics}")
+
+        val_metric = val_metrics[phase_context["tune_metric"]]
+        print(f"Val {phase_context['tune_metric']}: {val_metric:.4f}")
+
+        is_best = (
+            phase_context["higher_is_better"] and val_metric > best_val_metric
+        ) or ((not phase_context["higher_is_better"]) and val_metric < best_val_metric)
+        if is_best:
+            best_val_metric = val_metric
+            best_epoch = epoch
+            best_state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            patience_counter = 0
+            print(f"✓ New best model! (epoch {epoch}, {phase_context['tune_metric']}={val_metric:.4f})")
+        else:
+            patience_counter += 1
+            print(f"No improvement for {patience_counter} epoch(s)")
+
+        if patience_counter >= patience:
+            print(f"\nEarly stopping triggered! No improvement for {patience} epochs.")
+            print(
+                f"Best model was at epoch {best_epoch} with "
+                f"{phase_context['tune_metric']}={best_val_metric:.4f}"
+            )
+            break
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    print("\n" + "=" * 80)
+    print(f"{phase_name} training completed!")
+    print(f"Best epoch: {best_epoch}")
+    if best_val_metric is not None:
+        print(f"Best val {phase_context['tune_metric']}: {best_val_metric:.4f}")
+    print("=" * 80)
+    return best_val_metric, best_epoch, best_state_dict
+
+
+def train_mixed_pretrain_phase(model, pretrain_contexts, epochs):
+    print(f"\nStarting mixed pretraining for {epochs} epochs...")
+    print("=" * 80)
+    print("Mixing strategy: proportional to per-task train loader length")
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    for epoch in range(1, epochs + 1):
+        print(f"\nMixed Pretrain Epoch {epoch}/{epochs}")
+        print("-" * 80)
+        model.train()
+
+        loader_iters = [iter(ctx["ar_loader_dict"]["train"]) for ctx in pretrain_contexts]
+        schedule = []
+        for i, ctx in enumerate(pretrain_contexts):
+            schedule.extend([i] * len(ctx["ar_loader_dict"]["train"]))
+        random.Random(args.seed + epoch).shuffle(schedule)
+
+        total_steps = min(len(schedule), args.max_steps_per_epoch)
+        task_step_counts = [0 for _ in pretrain_contexts]
+        total_loss = 0.0
+        total_samples = 0
+
+        pbar = tqdm(schedule[:total_steps], desc="Mixed pretraining")
+        for task_idx in pbar:
+            ctx = pretrain_contexts[task_idx]
+            try:
+                batch = next(loader_iters[task_idx])
+            except StopIteration:
+                continue
+
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            logits = model(batch)
+            target = batch["target_label"]
+
+            if ctx["task"].task_type == TaskType.BINARY_CLASSIFICATION:
+                loss = ctx["loss_fn"](logits.squeeze(-1), target)
+            elif ctx["task"].task_type == TaskType.REGRESSION:
+                loss = ctx["loss_fn"](logits.squeeze(-1), target)
+            else:
+                loss = ctx["loss_fn"](logits, target)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            bs = target.size(0)
+            total_loss += loss.item() * bs
+            total_samples += bs
+            task_step_counts[task_idx] += 1
+
+        avg_loss = total_loss / max(total_samples, 1)
+        print(f"Mixed pretrain loss: {avg_loss:.4f}")
+        for i, ctx in enumerate(pretrain_contexts):
+            print(
+                f"  {ctx['dataset_name']}:{ctx['task_name']} "
+                f"steps={task_step_counts[i]}"
+            )
+
+    print("\n" + "=" * 80)
+    print("Mixed pretraining completed!")
+    print("=" * 80)
+
+
+pretrain_specs = [parse_task_spec(spec, args.dataset) for spec in args.pretrain_tasks]
+final_spec = (args.dataset, args.task)
+all_phase_specs = pretrain_specs + [final_spec]
+
+phase_contexts = []
+for i, (dataset_name, task_name) in enumerate(all_phase_specs):
+    show_stats = args.verbose and (i == len(all_phase_specs) - 1)
+    phase_contexts.append(prepare_task_context(dataset_name, task_name, show_stats=show_stats))
+
+final_context = phase_contexts[-1]
+for context in phase_contexts:
+    if context["task"].task_type != final_context["task"].task_type:
+        raise ValueError(
+            f"Incompatible task types for sequential pretraining: "
+            f"{context['dataset_name']}:{context['task_name']} is {context['task'].task_type}, "
+            f"but final task {final_context['dataset_name']}:{final_context['task_name']} "
+            f"is {final_context['task'].task_type}"
+        )
+    if context["out_channels"] != final_context["out_channels"]:
+        raise ValueError(
+            f"Incompatible output dimension: {context['dataset_name']}:{context['task_name']} "
+            f"has {context['out_channels']} classes, but final task has {final_context['out_channels']}"
+        )
+    if context["channels"] != final_context["channels"]:
+        raise ValueError(
+            f"Incompatible embedding channels: {context['dataset_name']}:{context['task_name']} "
+            f"has {context['channels']}, but final task has {final_context['channels']}"
+        )
+
+entity_embed_dim = (
+    final_context["builder"].entity_embeddings.shape[1] if args.use_entity_embedding else None
+)
+model = RelTS_Model(
+    channels=final_context["channels"],
+    task_type=final_context["task"].task_type,
+    entity_embed_dim=entity_embed_dim,
+    use_entity_embedding=args.use_entity_embedding,
+    num_heads=args.num_heads,
+    num_layers=args.num_layers,
+    ff_dim=args.ff_dim,
+    dropout=args.dropout,
+    num_classes=final_context["out_channels"],
+).to(device)
+print("  Model: RelTS (Temporal Sequence Model)")
+print(f"    Embedding dim: {final_context['channels']}")
+print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+best_val_metric = None
+best_epoch = 0
+best_state_dict = None
+if len(pretrain_specs) > 0:
+    if args.pretrain_epochs > 0:
+        if args.pretrain_mode == "mixed":
+            train_mixed_pretrain_phase(model, phase_contexts[:-1], args.pretrain_epochs)
+        else:
+            for idx, context in enumerate(phase_contexts[:-1]):
+                phase_name = f"pretrain phase {idx + 1}/{len(pretrain_specs)} ({context['dataset_name']}:{context['task_name']})"
+                train_phase(
+                    model,
+                    context,
+                    args.pretrain_epochs,
+                    phase_name,
+                )
+    else:
+        print(f"\nSkipping pretraining because pretrain_epochs={args.pretrain_epochs}")
+
+final_phase_name = f"final phase ({final_context['dataset_name']}:{final_context['task_name']})"
+if args.epochs <= 0:
+    print(f"\nSkipping {final_phase_name} because epochs={args.epochs}")
+else:
+    best_val_metric, best_epoch, best_state_dict = train_phase(
+        model,
+        final_context,
+        args.epochs,
+        final_phase_name,
+    )
+
+task = final_context["task"]
+loss_fn = final_context["loss_fn"]
+tune_metric = final_context["tune_metric"]
+clamp_min = final_context["clamp_min"]
+clamp_max = final_context["clamp_max"]
+ar_loader_dict = final_context["ar_loader_dict"]
+
+# Evaluate on test set
+print("\nEvaluating on test set...")
+if args.verbose:
+    test_loss, test_metrics, test_seq_lengths, test_preds, test_targets = evaluate(
+        model,
+        ar_loader_dict["test"],
+        loss_fn,
+        task.task_type,
+        device,
+        clamp_min=clamp_min,
+        clamp_max=clamp_max,
+        return_sequence_lengths=True,
+        return_preds_targets=True,
+    )
+    # Analyze by sequence length quartiles
+    quartile_results = analyze_by_sequence_length(
+        test_preds, test_targets, test_seq_lengths, task.task_type
+    )
+    analyze_cold_start_gap(
+        test_preds, test_targets, test_seq_lengths, task.task_type
+    )
+    # Plot quartile trend as a line plot
+    plot_path = Path(args.results_path) / f"{args.dataset}_{args.task}_quartiles.png"
+    plot_quartile_results(quartile_results, plot_path)
+else:
+    test_loss, test_metrics = evaluate(
+        model,
+        ar_loader_dict["test"],
+        loss_fn,
+        task.task_type,
+        device,
+        clamp_min=clamp_min,
+        clamp_max=clamp_max,
+    )
+print(f"Test Loss: {test_loss:.4f}")
+print(f"Test Metrics: {test_metrics}")
+print(f"Test {tune_metric}: {test_metrics[tune_metric]:.4f}")
+print("="*80)
+
+
+if args.report:
+    results_path = Path(args.report_path) / f"{args.dataset}_{args.task}.json"
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    # Load existing results if file exists
+    if results_path.exists():
+        try:
+            with open(results_path, "r") as f:
+                content = f.read().strip()
+                if not content:
+                    # Empty file
+                    all_results = {}
+                else:
+                    all_results = json.loads(content)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Warning: Failed to parse existing results file {results_path}: {e}")
+            print("Starting with empty results dictionary.")
+            all_results = {}
+    else:
+        all_results = {}
+
+    # Add new result with timestamp as key
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    hyperparams = json.dumps({
+        "backbone": args.backbone,
+        "mode": args.mode,
+        "tag": args.tag,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "num_heads": args.num_heads,
+        "num_layers": args.num_layers,
+        "dropout": args.dropout,
+        "window_size": args.window_size,
+    })
+    # Ensure JSON-serializable types (cast numpy scalars to Python float/int)
+    metrics_for_json = {k: float(v) for k, v in test_metrics.items()}
+    result_entry = {
+        "source": "pretrain",
+        "seed": int(args.seed),
+        "best_epoch": int(best_epoch),
+        "test_metrics": metrics_for_json,
+    }
+    if best_val_metric is not None:
+        result_entry["best_val_metric"] = float(best_val_metric)
+    
+    all_results.setdefault(str(hyperparams), {})[timestamp] = result_entry
+
+    # Save back to file
+    with open(results_path, "w") as f:
+        json.dump(all_results, f, indent=2)
+    print(f"Results saved to {results_path}")
+
+if args.save:
+    # Save best sequence model weights only
+    ckpt_root = os.path.join(args.results_path, "transformers_fm")
+    os.makedirs(ckpt_root, exist_ok=True)
+    ckpt_name = f"{args.dataset}_{args.task}_{args.backbone}.pth"
+    ckpt_path = os.path.join(ckpt_root, ckpt_name)
+    if best_state_dict is None:
+        best_state_dict = model.state_dict()
+    torch.save(best_state_dict, ckpt_path)
+    print(f"Saved model checkpoint to: {ckpt_path}")
+
+    # Extract CLS embeddings for retrieval (sorted by target timestamp)
+    print("Extracting CLS embeddings for retrieval...")
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+    model.eval()
+
+    all_entity_ids = []
+    all_timestamps = []
+    all_cls = []
+    with torch.no_grad():
+        for split in ["train", "val", "test"]:
+            for batch in tqdm(ar_loader_dict[split], desc=f"CLS encoding ({split})"):
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                cls_emb = model.encode_cls(batch)
+                all_entity_ids.append(batch["entity_id"].detach().cpu())
+                all_timestamps.append(batch["target_timestamp"].detach().cpu())
+                all_cls.append(cls_emb.detach().cpu())
+
+    entity_ids = torch.cat(all_entity_ids, dim=0)
+    timestamps = torch.cat(all_timestamps, dim=0)
+    cls_embeddings = torch.cat(all_cls, dim=0)
+
+    order = torch.from_numpy(np.lexsort((entity_ids.numpy(), timestamps.numpy())))
+    entity_ids = entity_ids[order]
+    timestamps = timestamps[order]
+    cls_embeddings = cls_embeddings[order]
+
+    retrieval_root = os.path.join(args.index_path, args.backbone, args.dataset, args.task)
+    os.makedirs(retrieval_root, exist_ok=True)
+    np.save(
+        os.path.join(retrieval_root, "cls_embeddings.npy"),
+        cls_embeddings.numpy().astype(np.float32, copy=False),
+    )
+    cls_meta = {
+        "entity_ids": entity_ids.long(),
+        "timestamps": timestamps.long(),
+    }
+    torch.save(cls_meta, os.path.join(retrieval_root, "cls_meta.pt"))
+    key = (cls_meta["entity_ids"].numpy().astype(np.uint64) << np.uint64(32)) | (
+        cls_meta["timestamps"].numpy().astype(np.uint64) & np.uint64(0xFFFFFFFF)
+    )
+    order_key = np.argsort(key, kind="mergesort")
+    key_sorted = key[order_key]
+    row_ids_sorted = np.arange(len(key), dtype=np.int64)[order_key]
+    np.savez_compressed(
+        os.path.join(retrieval_root, "cls_lookup.npz"),
+        key_sorted=key_sorted,
+        row_ids_sorted=row_ids_sorted,
+    )
+    print(f"Saved CLS retrieval data to: {retrieval_root}")
+
+# Explicitly release memory at the end of the run to avoid buildup across repeated experiments.
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()

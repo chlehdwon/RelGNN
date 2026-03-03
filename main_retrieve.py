@@ -44,6 +44,11 @@ parser.add_argument("--ff_dim", type=int, default=512)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--mode", type=str, default="recent", choices=["recent", "random"])
 parser.add_argument("--use_entity_embedding", action=argparse.BooleanOptionalAction)
+parser.add_argument(
+    "--fm",
+    action="store_true",
+    help="Load FM checkpoint from results_path/transformers_fm instead of results_path/transformers",
+)
 args = parser.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -131,7 +136,8 @@ cls_row_ids_sorted = cls_lookup["row_ids_sorted"].astype(np.int64, copy=False)
 n_total = int(cls_entity_ids.size(0))
 
 # Load checkpoint: always use pretrained transformer (no separate retriever checkpoint)
-ckpt_path = os.path.join(args.results_path, "transformers", f"{args.dataset}_{args.task}_{args.backbone}.pth")
+ckpt_dir = "transformers_fm" if args.fm else "transformers"
+ckpt_path = os.path.join(args.results_path, ckpt_dir, f"{args.dataset}_{args.task}_{args.backbone}.pth")
 if not os.path.exists(ckpt_path):
     raise FileNotFoundError(f"Pretrained checkpoint not found: {ckpt_path}")
 model.load_state_dict(torch.load(ckpt_path, map_location=device))
