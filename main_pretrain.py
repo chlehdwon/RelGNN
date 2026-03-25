@@ -9,13 +9,16 @@ os.environ["NUMEXPR_NUM_THREADS"] = "4" # export NUMEXPR_NUM_THREADS=6
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 import gc
+import math
 
 import numpy as np
 import torch
 from torch.nn import BCEWithLogitsLoss, L1Loss
+import torch.nn.functional as F
 from torch_frame import stype
 from torch_frame.config.text_embedder import TextEmbedderConfig
 from torch_geometric.seed import seed_everything
@@ -77,10 +80,36 @@ parser.add_argument("--epochs", type=int, default=20, help="Number of training e
 parser.add_argument("--max_steps_per_epoch", type=int, default=2000, help="Maximum number of steps per epoch")
 parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
 parser.add_argument("--weight_decay", type=float, default=1e-6, help="Weight decay")
+parser.add_argument(
+    "--scheduler",
+    type=str,
+    default="none",
+    choices=["none", "cosine"],
+    help="Learning-rate scheduler type",
+)
+parser.add_argument(
+    "--warmup_ratio",
+    type=float,
+    default=0.0,
+    help="Warmup ratio for scheduler, applied over total optimization steps",
+)
+parser.add_argument(
+    "--min_lr_ratio",
+    type=float,
+    default=0.1,
+    help="Final LR ratio for cosine decay",
+)
 parser.add_argument("--num_heads", type=int, default=4, help="Number of attention heads")
 parser.add_argument("--num_layers", type=int, default=4, help="Number of transformer layers")
 parser.add_argument("--ff_dim", type=int, default=512, help="Feedforward dimension")
 parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
+parser.add_argument(
+    "--loss_reweighting",
+    type=str,
+    default="none",
+    choices=["none", "balanced"],
+    help="Binary classification loss reweighting mode",
+)
 parser.add_argument(
     "--mode",
     type=str,
@@ -107,6 +136,11 @@ parser.add_argument(
  
 args = parser.parse_args()
 
+
+def cli_flag_provided(flag_name: str) -> bool:
+    option = f"--{flag_name}"
+    return any(arg == option or arg.startswith(f"{option}=") for arg in sys.argv[1:])
+
 # Use train_config from relgnn.utils.get_configs when available.
 train_config = None
 if not args.ignore_train_config:
@@ -119,13 +153,19 @@ if not args.ignore_train_config:
         pass
 
 if train_config:
-    if "lr" in train_config:
+    explicit_cli = {
+        "lr": cli_flag_provided("lr"),
+        "weight_decay": cli_flag_provided("weight_decay"),
+        "window_size": cli_flag_provided("window_size"),
+        "seed": cli_flag_provided("seed"),
+    }
+    if "lr" in train_config and not explicit_cli["lr"]:
         args.lr = float(train_config["lr"])
-    if "weight_decay" in train_config:
+    if "weight_decay" in train_config and not explicit_cli["weight_decay"]:
         args.weight_decay = float(train_config["weight_decay"])
-    if "window_size" in train_config:
+    if "window_size" in train_config and not explicit_cli["window_size"]:
         args.window_size = int(train_config["window_size"])
-    if "seed" in train_config:
+    if "seed" in train_config and not explicit_cli["seed"]:
         args.seed = int(train_config["seed"])
 
 # Construct checkpoint path: /data/relts/ckpts/{backbone}/{dataset}_{task}.pth
@@ -290,6 +330,53 @@ optimizer = torch.optim.AdamW(
     weight_decay=args.weight_decay,
 )
 
+steps_per_epoch = min(len(ar_loader_dict["train"]), args.max_steps_per_epoch)
+total_optimization_steps = max(1, steps_per_epoch * args.epochs)
+scheduler = None
+if args.scheduler == "cosine":
+    warmup_steps = int(total_optimization_steps * args.warmup_ratio)
+
+    def lr_lambda(current_step: int) -> float:
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step + 1) / float(max(1, warmup_steps))
+        progress = (current_step - warmup_steps) / float(max(1, total_optimization_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+binary_class_weights = None
+if task.task_type == TaskType.BINARY_CLASSIFICATION and args.loss_reweighting == "balanced":
+    train_targets_np = train_table.df[task.target_col].to_numpy(dtype=np.float32)
+    pos_count = float(train_targets_np.sum())
+    neg_count = float(train_targets_np.shape[0] - pos_count)
+    pos_weight = neg_count / max(pos_count, 1.0)
+    neg_weight = pos_count / max(neg_count, 1.0)
+    binary_class_weights = (float(neg_weight), float(pos_weight))
+    print(
+        "Using balanced BCE reweighting:",
+        f"neg_weight={neg_weight:.6f}, pos_weight={pos_weight:.6f}",
+    )
+
+
+def compute_loss(logits, target):
+    if task.task_type == TaskType.BINARY_CLASSIFICATION:
+        logits_flat = logits.squeeze(-1)
+        if binary_class_weights is None:
+            return loss_fn(logits_flat, target)
+        raw_loss = F.binary_cross_entropy_with_logits(logits_flat, target.float(), reduction="none")
+        neg_weight, pos_weight = binary_class_weights
+        sample_weight = torch.where(
+            target > 0.5,
+            torch.full_like(target, pos_weight),
+            torch.full_like(target, neg_weight),
+        )
+        return (raw_loss * sample_weight).mean()
+    if task.task_type == TaskType.REGRESSION:
+        return loss_fn(logits.squeeze(-1), target)
+    return loss_fn(logits, target)
+
 # Training function
 def train(model, loader, optimizer, loss_fn, device):
     model.train()
@@ -308,18 +395,15 @@ def train(model, loader, optimizer, loss_fn, device):
         target = batch['target_label']
         
         # Compute loss
-        if task.task_type == TaskType.BINARY_CLASSIFICATION:
-            loss = loss_fn(logits.squeeze(-1), target)
-        elif task.task_type == TaskType.REGRESSION:
-            loss = loss_fn(logits.squeeze(-1), target)
-        else:  # MULTILABEL_CLASSIFICATION
-            loss = loss_fn(logits, target)
+        loss = compute_loss(logits, target)
         
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         
         total_loss += loss.item() * batch['target_label'].size(0)
         total_samples += batch['target_label'].size(0)
@@ -355,15 +439,15 @@ def evaluate(model, loader, loss_fn, device, return_sequence_lengths=False, retu
         
         # Compute loss
         if task.task_type == TaskType.BINARY_CLASSIFICATION:
-            loss = loss_fn(logits.squeeze(-1), target)
+            loss = compute_loss(logits, target)
             preds = torch.sigmoid(logits.squeeze(-1))
         elif task.task_type == TaskType.REGRESSION:
-            loss = loss_fn(logits.squeeze(-1), target)
+            loss = compute_loss(logits, target)
             preds = logits.squeeze(-1)
             if clamp_min is not None:
                 preds = preds.clamp(clamp_min, clamp_max)
         else:  # MULTILABEL_CLASSIFICATION
-            loss = loss_fn(logits, target)
+            loss = compute_loss(logits, target)
             preds = torch.sigmoid(logits)
         
         total_loss += loss.item() * target.size(0)
@@ -403,6 +487,10 @@ def evaluate(model, loader, loss_fn, device, return_sequence_lengths=False, retu
 print(f"\nStarting training for {args.epochs} epochs...")
 print("="*80)
 print("Early stopping patience: 5 epochs")
+print(
+    f"Scheduler: {args.scheduler}, warmup_ratio={args.warmup_ratio}, "
+    f"min_lr_ratio={args.min_lr_ratio}"
+)
 
 best_val_metric = -float('inf') if higher_is_better else float('inf')
 best_epoch = 0
@@ -413,6 +501,8 @@ patience_counter = 0
 for epoch in range(1, args.epochs + 1):
     print(f"\nEpoch {epoch}/{args.epochs}")
     print("-" * 80)
+    current_lr = optimizer.param_groups[0]["lr"]
+    print(f"Current LR: {current_lr:.8f}")
     
     # Train
     train_loss = train(model, ar_loader_dict['train'], optimizer, loss_fn, device)
@@ -456,6 +546,9 @@ print("="*80)
 
 # Evaluate on test set
 print("\nEvaluating on test set...")
+if best_state_dict is not None:
+    print(f"Loading best checkpoint from epoch {best_epoch} before test evaluation...")
+    model.load_state_dict(best_state_dict)
 if args.verbose:
     test_loss, test_metrics, test_seq_lengths, test_preds, test_targets = evaluate(
         model, ar_loader_dict['test'], loss_fn, device, 
@@ -509,6 +602,10 @@ if args.report:
         "tag": args.tag,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
+        "scheduler": args.scheduler,
+        "warmup_ratio": args.warmup_ratio,
+        "min_lr_ratio": args.min_lr_ratio,
+        "loss_reweighting": args.loss_reweighting,
         "num_heads": args.num_heads,
         "num_layers": args.num_layers,
         "dropout": args.dropout,

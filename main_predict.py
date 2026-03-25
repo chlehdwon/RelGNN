@@ -6,6 +6,7 @@ Ref token = retrieved cls_embedding + label_embedding (5 retrieved past same-ent
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -64,6 +65,11 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+
+def cli_flag_provided(flag_name: str) -> bool:
+    option = f"--{flag_name}"
+    return any(arg == option or arg.startswith(f"{option}=") for arg in sys.argv[1:])
+
 # Use train_config from relgnn.utils.get_configs when available; override only if user left CLI at default.
 train_config = None
 if not args.ignore_train_config:
@@ -76,13 +82,19 @@ if not args.ignore_train_config:
         pass
 
 if train_config:
-    if "lr" in train_config:
+    explicit_cli = {
+        "lr": cli_flag_provided("lr"),
+        "weight_decay": cli_flag_provided("weight_decay"),
+        "window_size": cli_flag_provided("window_size"),
+        "seed": cli_flag_provided("seed"),
+    }
+    if "lr" in train_config and not explicit_cli["lr"]:
         args.lr = float(train_config["lr"])
-    if "weight_decay" in train_config:
+    if "weight_decay" in train_config and not explicit_cli["weight_decay"]:
         args.weight_decay = float(train_config["weight_decay"])
-    if "window_size" in train_config:
+    if "window_size" in train_config and not explicit_cli["window_size"]:
         args.window_size = int(train_config["window_size"])
-    if "seed" in train_config:
+    if "seed" in train_config and not explicit_cli["seed"]:
         args.seed = int(train_config["seed"])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -425,6 +437,9 @@ if best_val_metric is not None and best_val_metric != -float("inf") and best_val
 print("=" * 80)
 
 # Evaluate on test set
+if best_state_dict is not None:
+    print(f"Loading best checkpoint from epoch {best_epoch} before test evaluation...")
+    model.load_state_dict(best_state_dict)
 print("\nEvaluating on test set...")
 test_loss, test_metrics = evaluate(ar_loader_dict["test"])
 print(f"Test Loss: {test_loss:.4f}")

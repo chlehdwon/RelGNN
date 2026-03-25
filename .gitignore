@@ -9,3 +9,14 @@ cache
 scripts/
 analysis/
 results*/
+.codex
+!.codex/
+!.codex/skills/
+!.codex/skills/relts-results-reporting/
+!.codex/skills/relts-results-reporting/**
+!.codex/skills/relts-research-feedback/
+!.codex/skills/relts-research-feedback/**
+!.codex/skills/relts-research-intern/
+!.codex/skills/relts-research-intern/**
+markdowns
+intern

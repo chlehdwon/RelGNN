@@ -61,6 +61,8 @@ def _process_one_results(results, stage, task_type, higher_is_better):
             "window_size": setting.get("window_size"),
             "top_k": setting.get("top_k"),
             "ref_baseline": setting.get("ref_baseline"),
+            "retrieval_proj_head": setting.get("retrieval_proj_head"),
+            "retrieval_proj_out_dim": setting.get("retrieval_proj_out_dim"),
             "mean_metric": np.mean(seed_means),
             "std_metric": np.std(seed_means, ddof=1) if len(seed_means) > 1 else 0.0,
             "num_seeds": len(seed_means),
@@ -113,6 +115,8 @@ def _process_merged_results(results, task_type, higher_is_better):
             "window_size": setting.get("window_size"),
             "top_k": setting.get("top_k"),
             "ref_baseline": setting.get("ref_baseline"),
+            "retrieval_proj_head": setting.get("retrieval_proj_head"),
+            "retrieval_proj_out_dim": setting.get("retrieval_proj_out_dim"),
             "mean_metric": np.mean(seed_means),
             "std_metric": np.std(seed_means, ddof=1) if len(seed_means) > 1 else 0.0,
             "num_seeds": len(seed_means),
@@ -123,7 +127,7 @@ def _process_merged_results(results, task_type, higher_is_better):
     return rows
 
 
-def analyze_results(results_dir, dataset, task):
+def analyze_results(results_dir, dataset, task, verbose=True):
     """Analyze merged results from one file."""
     results_dir = Path(results_dir)
     task_obj = get_task(dataset, task, download=True)
@@ -144,8 +148,9 @@ def analyze_results(results_dir, dataset, task):
         )
 
     if not rows:
-        print(f"Error: No result files found for {dataset}/{task}.")
-        print(f"  Looked for: {pretrain_path}")
+        if verbose:
+            print(f"Error: No result files found for {dataset}/{task}.")
+            print(f"  Looked for: {pretrain_path}")
         exit(1)
 
     df = pd.DataFrame(rows)
@@ -158,31 +163,33 @@ def analyze_results(results_dir, dataset, task):
 
     output_csv = results_dir / f"{base_name}_summary.csv"
     df.to_csv(output_csv, index=False, float_format="%.6f")
-    print(f"Results saved to: {output_csv}")
+    if verbose:
+        print(f"Results saved to: {output_csv}")
 
     # Print by stage
-    for stage in df["stage"].unique():
-        subset = df[df["stage"] == stage]
-        print(f"\n--- {stage.upper()} (top 10) ---")
-        print(subset.head(10).to_string(index=False))
+    if verbose:
+        for stage in df["stage"].unique():
+            subset = df[df["stage"] == stage]
+            print(f"\n--- {stage.upper()} (top 10) ---")
+            print(subset.head(10).to_string(index=False))
 
-    print(f"\n{'='*80}")
-    print("BEST PER STAGE:")
-    print(f"{'='*80}")
-    for stage in df["stage"].unique():
-        stage_df = df[df["stage"] == stage]
-        if stage_df.empty:
-            continue
-        best = stage_df.iloc[0]
-        print(f"\n[{stage.upper()}]")
-        print(f"  tag: {best['tag']}, mode: {best['mode']}, backbone: {best['backbone']}")
-        if best.get("ref_baseline") is not None:
-            print(f"  ref_baseline: {best['ref_baseline']}")
-        print(f"  lr: {best['lr']}, weight_decay: {best['weight_decay']}")
-        print(f"  num_heads: {best['num_heads']}, num_layers: {best['num_layers']}, dropout: {best['dropout']}, window_size: {best['window_size']}")
-        print(f"  mean_metric: {best['mean_metric']:.6f} ± {best['std_metric']:.6f} (seeds: {int(best['num_seeds'])})")
-        print(f"  best_seed: {int(best['best_seed'])}, best_seed_metric: {best['best_seed_metric']:.6f}")
-    print(f"{'='*80}")
+        print(f"\n{'='*80}")
+        print("BEST PER STAGE:")
+        print(f"{'='*80}")
+        for stage in df["stage"].unique():
+            stage_df = df[df["stage"] == stage]
+            if stage_df.empty:
+                continue
+            best = stage_df.iloc[0]
+            print(f"\n[{stage.upper()}]")
+            print(f"  tag: {best['tag']}, mode: {best['mode']}, backbone: {best['backbone']}")
+            if best.get("ref_baseline") is not None:
+                print(f"  ref_baseline: {best['ref_baseline']}")
+            print(f"  lr: {best['lr']}, weight_decay: {best['weight_decay']}")
+            print(f"  num_heads: {best['num_heads']}, num_layers: {best['num_layers']}, dropout: {best['dropout']}, window_size: {best['window_size']}")
+            print(f"  mean_metric: {best['mean_metric']:.6f} ± {best['std_metric']:.6f} (seeds: {int(best['num_seeds'])})")
+            print(f"  best_seed: {int(best['best_seed'])}, best_seed_metric: {best['best_seed_metric']:.6f}")
+        print(f"{'='*80}")
     return df
 
 

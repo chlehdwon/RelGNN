@@ -10,7 +10,8 @@ from model import RelTS_Model
 class RelTS_Cross_Model(nn.Module):
     """
     Keep base sequence path unchanged: [CLS] [ctx1] ... [target].
-    Merge retrieved references through cross-attention on CLS only.
+    Merge retrieved memory tokens into CLS through cross-attention.
+    Retrieved memory can be one token per reference or a flattened set of recent context tokens.
     """
 
     def __init__(
@@ -88,13 +89,21 @@ class RelTS_Cross_Model(nn.Module):
         }
         return context_batch
 
+    def _get_retrieved_memory(self, batch: Dict[str, Tensor]) -> Optional[Tensor]:
+        if "retrieved_ref_tokens" in batch:
+            return batch["retrieved_ref_tokens"]
+        return batch.get("retrieved_cls_emb")
+
     def _build_ref_tokens(self, batch: Dict[str, Tensor]) -> Tensor:
-        ref_tokens = batch["retrieved_cls_emb"]
+        ref_tokens = self._get_retrieved_memory(batch)
+        if ref_tokens is None:
+            raise ValueError("Retrieved memory tokens are required for cross-attention.")
+
         if self.use_ref_time_label and (
             "retrieved_labels" in batch and "retrieved_timestamps" in batch
         ):
             bsz, k = batch["retrieved_labels"].shape
-            ref_mask_for_label = torch.zeros(
+            ref_mask_for_label = ~batch["retrieved_ref_mask"] if "retrieved_ref_mask" in batch else torch.zeros(
                 bsz, k, dtype=torch.bool, device=ref_tokens.device
             )
             ref_time_emb = self.base_model.temporal_encoder(
@@ -116,15 +125,16 @@ class RelTS_Cross_Model(nn.Module):
         h = self.base_model._encode_sequence(context_batch)
         cls_repr = h[:, 0, :]
 
-        if "retrieved_cls_emb" not in batch:
+        retrieved_memory = self._get_retrieved_memory(batch)
+        if retrieved_memory is None:
             return self.base_model.classifier(cls_repr)
 
         ref_mask = batch.get("retrieved_ref_mask")
         if ref_mask is None:
             ref_mask = torch.ones(
-                batch["retrieved_cls_emb"].shape[:2],
+                retrieved_memory.shape[:2],
                 dtype=torch.bool,
-                device=batch["retrieved_cls_emb"].device,
+                device=retrieved_memory.device,
             )
         valid_any = ref_mask.any(dim=1)
         if not bool(valid_any.any().item()):

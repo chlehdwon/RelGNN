@@ -8,6 +8,7 @@ import argparse
 import gc
 import json
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -66,6 +67,11 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+
+def cli_flag_provided(flag_name: str) -> bool:
+    option = f"--{flag_name}"
+    return any(arg == option or arg.startswith(f"{option}=") for arg in sys.argv[1:])
+
 # Use train_config from relgnn.utils.get_configs when available.
 train_config = None
 if not args.ignore_train_config:
@@ -79,9 +85,13 @@ if not args.ignore_train_config:
         pass
 
 if train_config:
-    if "window_size" in train_config:
+    explicit_cli = {
+        "window_size": cli_flag_provided("window_size"),
+        "seed": cli_flag_provided("seed"),
+    }
+    if "window_size" in train_config and not explicit_cli["window_size"]:
         args.window_size = int(train_config["window_size"])
-    if "seed" in train_config:
+    if "seed" in train_config and not explicit_cli["seed"]:
         args.seed = int(train_config["seed"])
 
 
@@ -324,7 +334,7 @@ if tune_metric in test_metrics:
 print("=" * 80)
 
 if args.report:
-    results_path = Path(args.report_path) / f"{args.dataset}_{args.task}_predict_vote.json"
+    results_path = Path(args.report_path) / f"{args.dataset}_{args.task}.json"
     results_path.parent.mkdir(parents=True, exist_ok=True)
     if results_path.exists():
         try:
@@ -351,6 +361,7 @@ if args.report:
     )
 
     result_entry = {
+        "source": "predict_vote",
         "seed": int(args.seed),
         "val_metrics": {k: float(v) for k, v in val_metrics.items()},
         "test_metrics": {k: float(v) for k, v in test_metrics.items()},
